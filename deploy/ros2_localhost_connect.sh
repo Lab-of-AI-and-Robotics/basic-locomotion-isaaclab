@@ -1,5 +1,10 @@
 #!/bin/bash
 echo "Remember to run this file with: source ros2_localhost_connect.sh"
+
+if [ -n "$CONDA_PREFIX" ] && [ -x "$CONDA_PREFIX/bin/ros2" ]; then
+	export PATH="$CONDA_PREFIX/bin:$PATH"
+fi
+
 export ROS_LOCALHOST_ONLY=1
 unset ROS_DISCOVERY_SERVER
 unset ROS_SUPER_CLIENT

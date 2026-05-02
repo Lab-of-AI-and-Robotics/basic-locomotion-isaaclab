@@ -1,0 +1,347 @@
+basic-locomotion-isaaclab deploy guide
+======================================
+
+이 문서는 /home/lair0/isaac_projects/basic-locomotion-isaaclab 프로젝트를
+sim-to-sim 및 sim-to-real deploy에 적용하기 위한 절차를 정리한 문서이다.
+
+
+1. 프로젝트 개요
+---------------
+
+이 저장소는 Isaac Lab 기반 사족보행 강화학습 프로젝트이다.
+Aliengo, Go2, B2, HyQReal 계열 로봇의 locomotion policy를 학습하고,
+MuJoCo sim-to-sim 및 ROS2 sim-to-real 배포를 지원한다.
+
+현재 로컬 저장소의 GitHub remote:
+
+  https://github.com/iit-DLSLab/basic-locomotion-isaaclab
+
+주요 폴더:
+
+  README.md
+    프로젝트 개요.
+
+  README_TRAIN.md
+    Isaac Lab 학습 실행 방법.
+
+  README_DEPLOY.md
+    MuJoCo, ROS1, ROS2 배포 실행 방법.
+
+  source/basic_locomotion_isaaclab
+    Isaac Lab extension Python 패키지.
+
+  scripts
+    rsl_rl, morphosymm_rl, amp_rl, dagger 학습/재생 스크립트.
+
+  deploy
+    MuJoCo/ROS deploy 코드, ROS workspace, Docker/Conda 환경 파일.
+
+  tested_policies
+    이미 학습된 policy checkpoint 및 exported policy 파일.
+
+
+2. 현재 환경 확인 결과
+---------------------
+
+확인 당시 활성화된 Conda 환경:
+
+  env_isaaclab
+
+주요 버전:
+
+  Python: 3.11.13
+  Isaac Sim: 5.0.0
+  IsaacLab: 0.45.1
+  rsl-rl-lib: 2.3.3
+  Torch: 2.7.0+cu128
+  GPU: NVIDIA GeForce RTX 4090
+  NVIDIA Driver: 550.163.01
+
+현재 활성 환경에서 deploy 필수 패키지 확인 결과:
+
+  mujoco: 없음
+  gym_quadruped: 없음
+  onnxruntime: 없음
+  rclpy: import 실패
+
+rclpy import 실패 원인:
+
+  현재 env_isaaclab은 Python 3.11이다.
+  하지만 /opt/ros/humble 쪽 ROS2 Python 패키지는 Python 3.10용으로 설치되어 있다.
+  따라서 Python ABI mismatch 때문에 rclpy가 정상 import되지 않는다.
+
+결론:
+
+  현재 활성 env_isaaclab 환경은 deploy 실행에 바로 호환되지 않는다.
+  Isaac Lab 학습용 환경과 deploy용 ROS/MuJoCo 환경을 분리하는 것을 권장한다.
+
+
+3. Deploy용 환경 만들기
+----------------------
+
+저장소에는 ROS2 deploy용 Conda 환경 파일이 포함되어 있다.
+
+  deploy/installation/mamba_environment_ros2.yaml
+
+현재 시스템에는 mamba가 없고 conda가 있으므로 conda로 생성한다.
+
+명령:
+
+  cd /home/lair0/isaac_projects/basic-locomotion-isaaclab
+  conda env create -f deploy/installation/mamba_environment_ros2.yaml
+  conda activate basic_locomotion_isaaclab_ros2_env
+
+환경 생성 후 필수 import 확인:
+
+  python - <<'PY'
+  import mujoco
+  import gym_quadruped
+  import onnxruntime
+  import torch
+  import rclpy
+  print("deploy env OK")
+  PY
+
+만약 mujoco가 없으면 추가 설치:
+
+  python -m pip install mujoco
+
+주의:
+
+  기존 shell에 /opt/ros/humble의 PYTHONPATH, LD_LIBRARY_PATH가 섞여 있을 수 있다.
+  가능하면 새 터미널에서 깨끗하게 시작한 뒤 다음 순서로 실행한다.
+
+    conda activate basic_locomotion_isaaclab_ros2_env
+
+
+4. 현재 deploy 설정
+------------------
+
+현재 deploy/config.py 기준 설정:
+
+  robot = 'go2'
+  scene = 'random_boxes'
+  policy_folder_path =
+    tested_policies/go2/symmetricactor_data_augmented
+
+이 policy 폴더에는 다음 export 파일이 있다.
+
+  tested_policies/go2/symmetricactor_data_augmented/exported/policy.onnx
+  tested_policies/go2/symmetricactor_data_augmented/exported/policy.pt
+  tested_policies/go2/symmetricactor_data_augmented/params/env.yaml
+
+현재 Go2 symmetricactor_data_augmented policy의 주요 설정:
+
+  use_imu: False
+  use_concurrent_state_est: False
+  use_rma: False
+  use_vision: None
+  use_observation_history: True
+  history_length: 5
+  single_observation_space: 52
+
+중요:
+
+  현재 policy는 concurrent state estimator를 사용하지 않는다.
+  따라서 sim-to-real에서는 /base_state를 publish하는 외부 state estimator가 필요하다.
+  README 기준으로는 muse 같은 state estimator를 사용하는 흐름이다.
+
+만약 base state estimator 없이 IMU/joint 기반 estimator를 쓰고 싶다면 다음 policy를 검토한다.
+
+  tested_policies/go2/concurrent_se
+  tested_policies/go2/concurrent_se_24k
+
+이 policy들은 exported/concurrent_state_estimator.pth 파일을 포함한다.
+
+
+5. MuJoCo direct sim-to-sim
+--------------------------
+
+ROS 없이 가장 먼저 확인할 실행이다.
+policy, MuJoCo, gym_quadruped, onnxruntime이 정상 동작하는지 검증한다.
+
+명령:
+
+  conda activate basic_locomotion_isaaclab_ros2_env
+  cd /home/lair0/isaac_projects/basic-locomotion-isaaclab
+  python3 deploy/play_mujoco.py
+
+이 단계가 성공하면 다음이 정상이라는 뜻이다.
+
+  policy.onnx 로드 가능
+  params/env.yaml 로드 가능
+  MuJoCo 환경 생성 가능
+  gym_quadruped 로봇 모델 사용 가능
+  RL policy inference 가능
+
+
+6. ROS2 기반 sim-to-sim
+-----------------------
+
+ROS2 topic을 통해 controller와 simulator를 분리해서 실행하는 방식이다.
+
+터미널 1: controller 실행
+
+  conda activate basic_locomotion_isaaclab_ros2_env
+  cd /home/lair0/isaac_projects/basic-locomotion-isaaclab
+  source deploy/ros2_localhost_connect.sh
+  python3 deploy/run_controller_ros2.py
+
+터미널 2: simulator 실행
+
+  conda activate basic_locomotion_isaaclab_ros2_env
+  cd /home/lair0/isaac_projects/basic-locomotion-isaaclab
+  source deploy/ros2_localhost_connect.sh
+  python3 deploy/run_simulator_ros2.py
+
+controller 터미널에 interactive console이 뜨면 다음 순서로 입력한다.
+
+  goUp
+  activate
+  ictp
+
+ictp 모드 키 입력:
+
+  w: 전진
+  s: 후진
+  a: 왼쪽 이동
+  d: 오른쪽 이동
+  q: 좌회전
+  e: 우회전
+  0: 정지
+
+
+7. ROS2 sim-to-real 적용 순서
+----------------------------
+
+실기체에서는 바로 RL policy를 activate하지 말고 단계적으로 확인한다.
+
+1. deploy/config.py 확인
+
+   현재 robot이 실제 로봇과 맞는지 확인한다.
+
+     robot = 'go2'
+
+   policy_folder_path가 원하는 policy 폴더를 가리키는지도 확인한다.
+
+2. ROS2 topic 준비 확인
+
+   현재 run_controller_ros2.py는 다음 topic을 구독한다.
+
+     /base_state
+     blind_state
+     imu
+     joy
+
+   그리고 다음 topic을 publish한다.
+
+     /trajectory_generator
+
+   현재 symmetricactor_data_augmented policy는 base state 기반이므로
+   /base_state를 publish하는 state estimator가 필요하다.
+
+3. 로봇 네트워크용 ROS2 연결 설정
+
+   conda activate basic_locomotion_isaaclab_ros2_env
+   cd /home/lair0/isaac_projects/basic-locomotion-isaaclab
+   source deploy/dls2_connect.sh
+   ros2 topic list
+
+4. controller 실행
+
+   python3 deploy/run_controller_ros2.py
+
+5. console에서 stand-up 먼저 실행
+
+   goUp
+
+6. 자세, joint state, state estimator, command topic이 정상인지 확인
+
+   예시 확인 명령:
+
+     ros2 topic list
+     ros2 topic echo /base_state
+     ros2 topic echo /trajectory_generator
+
+7. 이상이 없을 때 RL 활성화
+
+   activate
+
+8. keyboard command 또는 joystick으로 속도 명령 입력
+
+   keyboard 사용:
+
+     ictp
+
+
+8. 실행 전 체크리스트
+--------------------
+
+환경:
+
+  [ ] basic_locomotion_isaaclab_ros2_env가 생성되어 있다.
+  [ ] python import mujoco가 성공한다.
+  [ ] python import gym_quadruped가 성공한다.
+  [ ] python import onnxruntime가 성공한다.
+  [ ] python import rclpy가 성공한다.
+
+policy:
+
+  [ ] deploy/config.py의 robot 값이 실제 로봇과 맞다.
+  [ ] policy_folder_path가 존재한다.
+  [ ] policy_folder_path/exported/policy.onnx가 존재한다.
+  [ ] policy_folder_path/params/env.yaml이 존재한다.
+
+sim-to-sim:
+
+  [ ] python3 deploy/play_mujoco.py가 실행된다.
+  [ ] ROS2 sim-to-sim에서 controller와 simulator가 topic으로 연결된다.
+
+sim-to-real:
+
+  [ ] 로봇 통신 패키지가 실행 중이다.
+  [ ] /base_state 또는 policy에 필요한 state topic이 publish된다.
+  [ ] blind_state가 publish된다.
+  [ ] imu가 publish된다.
+  [ ] /trajectory_generator를 실제 robot interface가 구독한다.
+  [ ] goUp 동작이 안정적이다.
+  [ ] activate 전 emergency stop 절차가 준비되어 있다.
+
+
+9. 현재 상태 기준 권장 순서
+--------------------------
+
+현재 활성 env_isaaclab에서는 deploy를 바로 돌리기 어렵다.
+따라서 다음 순서로 진행하는 것을 권장한다.
+
+1. 새 deploy Conda 환경 생성
+
+   conda env create -f deploy/installation/mamba_environment_ros2.yaml
+
+2. 필수 import 확인
+
+   mujoco, gym_quadruped, onnxruntime, torch, rclpy
+
+3. MuJoCo direct sim-to-sim 실행
+
+   python3 deploy/play_mujoco.py
+
+4. ROS2 sim-to-sim 실행
+
+   deploy/run_controller_ros2.py
+   deploy/run_simulator_ros2.py
+
+5. 실제 로봇 topic/state estimator 연결 확인
+
+   ros2 topic list
+   ros2 topic echo /base_state
+
+6. sim-to-real controller 실행
+
+   python3 deploy/run_controller_ros2.py
+
+7. goUp 후 activate
+
+   goUp
+   activate
+

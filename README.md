@@ -37,6 +37,8 @@ A list of robots and environments available is described below:
 
 If you want only to deploy a trained policy on your robot, continue on [README_DEPLOY](https://github.com/iit-DLSLab/basic-locomotion-dls-isaaclab/blob/main/README_DEPLOY.md) otherwise on [README_TRAIN](https://github.com/iit-DLSLab/basic-locomotion-dls-isaaclab/blob/main/README_TRAIN.md).
 
+For a Korean step-by-step guide covering local sim-to-sim and Go2 sim-to-real execution, see [README_SIM2SIM_SIM2REAL_KO.md](README_SIM2SIM_SIM2REAL_KO.md).
+
 **For the train, check first the compatibility with IsaacLab and rsl-rl at the top of this readme. They indicate the releases that we tested.**
 
 

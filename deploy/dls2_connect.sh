@@ -1,5 +1,10 @@
 #!/bin/bash
 echo "Remeber to run this file with: source dls2_connect.sh"
+
+if [ -n "$CONDA_PREFIX" ] && [ -x "$CONDA_PREFIX/bin/ros2" ]; then
+	export PATH="$CONDA_PREFIX/bin:$PATH"
+fi
+
 export ROS_DISCOVERY_SERVER="127.0.0.1:11812;127.0.0.1:11813;127.0.0.1:11814;127.0.0.1:11818" && 
 export ROS_SUPER_CLIENT=TRUE && 
 export ROS_LOCALHOST_ONLY=0 &&

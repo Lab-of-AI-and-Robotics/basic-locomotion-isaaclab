@@ -1,0 +1,394 @@
+Go2 direct deploy guide
+=======================
+
+이 문서는 /home/lair0/isaac_projects/basic-locomotion-isaaclab 프로젝트에서
+Unitree Go2를 PC와 랜선으로 직접 연결해 키보드로 제어하는 절차를 정리한 문서이다.
+
+성공 확인된 흐름:
+
+  Go2 DDS topics
+      -> deploy/go2_unitree_bridge_ros2.py
+      -> /base_state, /blind_state, /imu
+      -> deploy/run_controller_ros2.py
+      -> /trajectory_generator
+      -> deploy/go2_unitree_bridge_ros2.py
+      -> /lowcmd
+      -> Go2
+
+
+1. 네트워크 연결
+----------------
+
+Go2와 PC를 랜선으로 직접 연결한다.
+
+PC의 유선 인터페이스 이름 확인:
+
+  ip -br addr
+
+이 PC에서는 유선 인터페이스가 enp13s0였다.
+
+Go2 direct Ethernet 대역으로 PC IP를 설정한다.
+
+  sudo ip addr flush dev enp13s0
+  sudo ip addr add 192.168.123.10/24 dev enp13s0
+  sudo ip link set enp13s0 up
+
+Go2와 ping 확인:
+
+  ping 192.168.123.161
+
+정상 예시:
+
+  64 bytes from 192.168.123.161
+
+현재 성공 확인된 네트워크 상태:
+
+  PC IP:  192.168.123.10/24
+  Go2 IP: 192.168.123.161
+
+
+2. 환경 준비
+------------
+
+새 터미널을 열고 프로젝트 폴더로 이동한다.
+
+  cd ~/isaac_projects/basic-locomotion-isaaclab
+
+Conda deploy 환경 활성화:
+
+  conda activate basic_locomotion_isaaclab_ros2_env
+
+Go2 direct DDS 연결 환경을 source한다.
+
+  source deploy/go2_direct_connect.sh
+
+이 스크립트가 하는 일:
+
+  - 이 프로젝트의 deploy/ros2_ws/install/setup.bash를 source
+  - ROS_LOCALHOST_ONLY=0 설정
+  - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp 설정
+  - 다른 ROS workspace의 PYTHONPATH 오염 제거
+  - Conda env의 ros2를 우선 사용
+
+정상 확인:
+
+  which ros2
+
+정상 출력 예시:
+
+  /home/lair0/anaconda3/envs/basic_locomotion_isaaclab_ros2_env/bin/ros2
+
+잘못된 출력 예시:
+
+  /opt/ros/humble/bin/ros2
+
+위처럼 나오면 환경이 섞인 것이므로 새 터미널에서 다시 시작한다.
+
+
+3. Go2 DDS topic 확인
+--------------------
+
+환경 source 후 topic을 확인한다.
+
+  ros2 topic list
+
+Go2가 정상 연결되면 다음과 같은 topic들이 보여야 한다.
+
+  /lowstate
+  /lowcmd
+  /sportmodestate
+  /utlidar/robot_pose
+  /utlidar/imu
+  /wirelesscontroller
+
+핵심 topic 확인:
+
+  ros2 topic echo /lowstate --once
+  ros2 topic echo /utlidar/robot_pose --once
+
+
+4. Bridge 실행
+--------------
+
+터미널 1에서 bridge를 실행한다.
+
+  cd ~/isaac_projects/basic-locomotion-isaaclab
+  conda activate basic_locomotion_isaaclab_ros2_env
+  source deploy/go2_direct_connect.sh
+
+실제 로봇에 low-level command를 보내는 실행:
+
+  python3 deploy/go2_unitree_bridge_ros2.py --ros-args -p publish_lowcmd:=true
+
+bridge 역할:
+
+  입력:
+    /lowstate
+    /utlidar/robot_pose
+    /trajectory_generator
+
+  출력:
+    /base_state
+    /blind_state
+    /imu
+    /lowcmd
+
+주의:
+
+  publish_lowcmd:=true 옵션을 주면 실제 로봇 모터로 command가 나간다.
+  처음 테스트할 때는 로봇을 지지대 위에 놓거나 넓은 공간에서 진행한다.
+
+dry-run 확인만 하고 싶을 때:
+
+  python3 deploy/go2_unitree_bridge_ros2.py
+
+dry-run에서는 /base_state, /blind_state, /imu는 publish하지만 /lowcmd는 보내지 않는다.
+
+
+5. Bridge 상태 확인
+-------------------
+
+터미널 3 또는 별도 확인 터미널에서:
+
+  cd ~/isaac_projects/basic-locomotion-isaaclab
+  conda activate basic_locomotion_isaaclab_ros2_env
+  source deploy/go2_direct_connect.sh
+
+bridge가 만든 controller 입력 topic 확인:
+
+  ros2 topic echo /base_state --once
+  ros2 topic echo /blind_state --once
+  ros2 topic echo /imu --once
+
+이 세 topic이 정상적으로 나오면 controller를 실행할 준비가 된 것이다.
+
+
+6. Controller 실행
+------------------
+
+터미널 2에서 controller를 실행한다.
+
+  cd ~/isaac_projects/basic-locomotion-isaaclab
+  conda activate basic_locomotion_isaaclab_ros2_env
+  source deploy/go2_direct_connect.sh
+
+  python3 deploy/run_controller_ros2.py
+
+controller 역할:
+
+  입력:
+    /base_state
+    /blind_state
+    /imu
+    /joy
+
+  출력:
+    /trajectory_generator
+
+controller가 정상 실행되면 interactive console이 표시된다.
+
+  Available Commands
+  help
+  ictp
+  goUp
+  goDown
+  activate
+  setKp
+  setKd
+
+
+7. 로봇 동작 순서
+----------------
+
+controller console에서 아래 순서로 입력한다.
+
+1. 로봇 세우기
+
+   goUp
+
+2. RL policy 활성화
+
+   activate
+
+3. 키보드 제어 모드 진입
+
+   ictp
+
+4. 키보드 명령
+
+   w: 전진
+   s: 후진
+   a: 왼쪽 이동
+   d: 오른쪽 이동
+   q: 좌회전
+   e: 우회전
+   0: 정지
+
+ictp 모드에서 빠져나오려면 위 명령 키가 아닌 아무 키나 누른다.
+
+RL policy를 끄려면 controller console에서 다시 입력한다.
+
+  activate
+
+로봇을 눕히려면:
+
+  goDown
+
+
+8. 정상 동작 확인
+-----------------
+
+controller가 /trajectory_generator를 publish하는지 확인:
+
+  ros2 topic info /trajectory_generator
+
+정상 예시:
+
+  Publisher count: 1
+  Subscription count: 1
+
+bridge가 /lowcmd를 publish하는지 확인:
+
+  ros2 topic info /lowcmd
+
+정상 예시:
+
+  Publisher count: 2
+  Subscription count: 1
+
+여기서 Publisher count가 2인 이유:
+
+  - Go2 내부 DDS app이 /lowcmd publisher로 보임
+  - 이 프로젝트의 go2_unitree_bridge도 /lowcmd publisher로 보임
+
+CRC 확인:
+
+  ros2 topic echo /lowcmd --once | grep crc
+
+정상적으로 bridge 코드가 적용되어 있으면 crc가 0이 아니어야 한다.
+
+
+9. 자주 발생한 문제와 해결
+--------------------------
+
+문제 1: unitree_go import 에러
+
+증상:
+
+  UnsupportedTypeSupport: Could not import 'rosidl_typesupport_c' for package 'unitree_go'
+  또는 /home/lair0/go2_ws/install/unitree_go/...python3.10... 경로가 보임
+
+원인:
+
+  다른 ROS workspace, 특히 /home/lair0/go2_ws/install/setup.bash가 source되어
+  Python 3.10용 unitree_go 메시지가 현재 Python 3.12 Conda 환경에 섞인 것이다.
+
+해결:
+
+  새 터미널을 열고 이 프로젝트의 direct connect만 source한다.
+
+    cd ~/isaac_projects/basic-locomotion-isaaclab
+    conda activate basic_locomotion_isaaclab_ros2_env
+    source deploy/go2_direct_connect.sh
+
+  이 터미널에서는 /home/lair0/go2_ws/install/setup.bash를 source하지 않는다.
+
+
+문제 2: 로봇이 움직이지 않음
+
+확인 1:
+
+  ros2 topic info /trajectory_generator
+
+정상:
+
+  Publisher count: 1
+  Subscription count: 1
+
+Publisher count가 0이면 controller가 실행 중이 아니다.
+
+확인 2:
+
+  pgrep -af 'go2_unitree_bridge_ros2.py|run_controller_ros2.py'
+
+정상:
+
+  go2_unitree_bridge_ros2.py --ros-args -p publish_lowcmd:=true
+  run_controller_ros2.py
+
+확인 3:
+
+  ros2 topic echo /lowcmd --once | grep crc
+
+crc가 0이면 로봇이 command를 무시할 수 있다.
+현재 bridge에는 Unitree LowCmd CRC 계산이 추가되어 있다.
+
+
+문제 3: ros2가 /opt/ros/humble/bin/ros2를 사용함
+
+확인:
+
+  which ros2
+
+정상:
+
+  /home/lair0/anaconda3/envs/basic_locomotion_isaaclab_ros2_env/bin/ros2
+
+해결:
+
+  새 터미널에서 다시:
+
+    conda activate basic_locomotion_isaaclab_ros2_env
+    source deploy/go2_direct_connect.sh
+
+
+10. 종료 순서
+-------------
+
+1. ictp에서 0을 눌러 정지 명령을 보낸다.
+
+2. controller console에서 policy를 끈다.
+
+   activate
+
+3. 필요하면 로봇을 눕힌다.
+
+   goDown
+
+4. controller 종료
+
+   Ctrl+C
+
+5. bridge 종료
+
+   Ctrl+C
+
+
+11. 최종 실행 요약
+------------------
+
+터미널 1:
+
+  cd ~/isaac_projects/basic-locomotion-isaaclab
+  conda activate basic_locomotion_isaaclab_ros2_env
+  source deploy/go2_direct_connect.sh
+  python3 deploy/go2_unitree_bridge_ros2.py --ros-args -p publish_lowcmd:=true
+
+터미널 2:
+
+  cd ~/isaac_projects/basic-locomotion-isaaclab
+  conda activate basic_locomotion_isaaclab_ros2_env
+  source deploy/go2_direct_connect.sh
+  python3 deploy/run_controller_ros2.py
+
+controller console:
+
+  goUp
+  activate
+  ictp
+
+keyboard:
+
+  w/s/a/d/q/e
+  0: stop
+
