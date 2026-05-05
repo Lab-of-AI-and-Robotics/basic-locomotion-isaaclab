@@ -12,10 +12,17 @@ safe_rl_payload_path = os.environ.get(
     "SAFE_RL_PAYLOAD",
     os.path.abspath(os.path.join(dir_path, "..", "safe_rl_basic_locomotion_handoff", "payload")),
 )
+go2_posture_policy_root = os.environ.get(
+    "GO2_POSTURE_POLICY_ROOT",
+    os.path.abspath(os.path.join(dir_path, "..", "tested_policies", "go2", "go2_posture_guidance")),
+)
+go2_posture_run_name = os.environ.get(
+    "GO2_POSTURE_RUN_NAME",
+    "2026-05-04_23-04-13_postureON_clampON_air0.0",
+)
 go2_posture_run_dir = os.environ.get(
     "GO2_POSTURE_RUN_DIR",
-    "/home/lair0/isaaclab_ws/go2_posture/logs/rsl_rl/go2_posture_direct/"
-    "2026-05-04_23-04-13_postureON_clampON_air0.0",
+    os.path.join(go2_posture_policy_root, go2_posture_run_name),
 )
 go2_posture_checkpoint = os.environ.get(
     "GO2_POSTURE_CHECKPOINT",

@@ -9,10 +9,17 @@ import yaml
 from gym_quadruped.utils.quadruped_utils import LegsAttr
 
 
-DEFAULT_RUN_DIR = (
-    "/home/lair0/isaaclab_ws/go2_posture/logs/rsl_rl/go2_posture_direct/"
-    "2026-05-04_23-04-13_postureON_clampON_air0.0"
+DEFAULT_POLICY_ROOT = Path(
+    os.environ.get(
+        "GO2_POSTURE_POLICY_ROOT",
+        Path(__file__).resolve().parents[1] / "tested_policies" / "go2" / "go2_posture_guidance",
+    )
+).expanduser()
+DEFAULT_RUN_NAME = os.environ.get(
+    "GO2_POSTURE_RUN_NAME",
+    "2026-05-04_23-04-13_postureON_clampON_air0.0",
 )
+DEFAULT_RUN_DIR = DEFAULT_POLICY_ROOT / DEFAULT_RUN_NAME
 
 
 def _flat_legs(legs):
