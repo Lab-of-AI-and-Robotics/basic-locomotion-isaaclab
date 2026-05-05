@@ -1,0 +1,129 @@
+Go2 posture guidance deploy commands
+====================================
+
+Repository:
+  /home/lair0/isaac_projects2/basic-locomotion-isaaclab
+
+Branch:
+  posure_guidance
+
+
+1. Get the posture guidance branch
+----------------------------------
+
+cd /home/lair0/isaac_projects2/basic-locomotion-isaaclab
+git switch posure_guidance
+git pull
+
+
+2. Start Unitree HAL
+--------------------
+
+Open terminal 1:
+
+cd /home/lair0/isaac_projects2/unitree-ros2-dls
+conda activate basic_locomotion_isaaclab_ros2_env
+source ros2_connect.bash
+python3 launch_quadruped_hal.py
+
+
+3. Start joystick input
+-----------------------
+
+Use ONE of the following.
+
+USB / Xbox joystick:
+
+conda activate basic_locomotion_isaaclab_ros2_env
+source /home/lair0/isaac_projects2/unitree-ros2-dls/ros2_connect.bash
+ros2 run joy joy_node --ros-args -p deadzone:=0.05
+
+Unitree wireless controller:
+
+cd /home/lair0/isaac_projects2/basic-locomotion-isaaclab
+conda activate basic_locomotion_isaaclab_ros2_env
+source /home/lair0/isaac_projects2/unitree-ros2-dls/ros2_connect.bash
+python deploy/unitree_wireless_to_joy.py
+
+
+4. Start posture policy controller
+----------------------------------
+
+Open terminal 3:
+
+cd /home/lair0/isaac_projects2/basic-locomotion-isaaclab
+conda activate basic_locomotion_isaaclab_ros2_env
+source /home/lair0/isaac_projects2/unitree-ros2-dls/ros2_connect.bash
+POLICY_BACKEND=go2_posture python deploy/run_controller_ros2.py \
+  --ros-args \
+  -p joy_max_forward_velocity:=2.0 \
+  -p joy_max_lateral_velocity:=1.0 \
+  -p joy_max_yaw_rate:=1.2 \
+  -p rl_activation_blend_time:=3.0
+
+
+5. Controller console commands
+------------------------------
+
+In the controller terminal:
+
+goUp
+activate
+
+To stop walking command from joystick, release stick or press controller stop command if mapped.
+
+
+6. Select a different trained policy run
+----------------------------------------
+
+Default run:
+  2026-05-04_23-04-13_postureON_clampON_air0.0
+
+Available runs:
+  2026-05-04_23-04-13_postureON_clampON_air0.0
+  2026-05-05_00-53-02_postureON_clampON_air0.5
+  2026-05-05_02-41-10_postureON_clampON_air1.0
+  2026-05-05_04-29-00_postureON_clampON_air2.0
+  2026-05-05_06-17-00_postureON_clampOFF_air0.0
+  2026-05-05_08-04-39_postureON_clampOFF_air0.5
+  2026-05-05_09-53-46_postureON_clampOFF_air1.0
+  2026-05-05_11-42-46_postureON_clampOFF_air2.0
+
+Example using the latest clampOFF air2.0 run:
+
+cd /home/lair0/isaac_projects2/basic-locomotion-isaaclab
+conda activate basic_locomotion_isaaclab_ros2_env
+source /home/lair0/isaac_projects2/unitree-ros2-dls/ros2_connect.bash
+GO2_POSTURE_RUN_NAME=2026-05-05_11-42-46_postureON_clampOFF_air2.0 \
+POLICY_BACKEND=go2_posture python deploy/run_controller_ros2.py \
+  --ros-args \
+  -p joy_max_forward_velocity:=2.0 \
+  -p joy_max_lateral_velocity:=1.0 \
+  -p joy_max_yaw_rate:=1.2 \
+  -p rl_activation_blend_time:=3.0
+
+
+7. Sim-to-sim MuJoCo test
+-------------------------
+
+cd /home/lair0/isaac_projects2/basic-locomotion-isaaclab
+conda activate basic_locomotion_isaaclab_ros2_env
+MUJOCO_KEY_MAX_LIN=2.0 python deploy/play_go2_posture_mujoco.py
+
+Headless short smoke test:
+
+cd /home/lair0/isaac_projects2/basic-locomotion-isaaclab
+conda activate basic_locomotion_isaaclab_ros2_env
+MUJOCO_HEADLESS=1 MUJOCO_MAX_STEPS=500 MUJOCO_CMD_X=0.4 MUJOCO_CMD_RAMP_TIME=1.0 \
+python deploy/play_go2_posture_mujoco.py
+
+
+Important notes
+---------------
+
+- Do not run deploy/go2_unitree_bridge_ros2.py together with launch_quadruped_hal.py.
+  Both can publish low-level commands.
+- This deploy path expects joystick command on /joy.
+- Forward joystick max speed is capped at 2.0 m/s by joy_max_forward_velocity.
+- The policy files are stored under:
+  tested_policies/go2/go2_posture_guidance
