@@ -1,0 +1,399 @@
+import os
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import yaml
+
+from gym_quadruped.utils.quadruped_utils import LegsAttr
+
+
+DEFAULT_RUN_DIR = (
+    "/home/lair0/isaaclab_ws/go2_posture/logs/rsl_rl/go2_posture_direct/"
+    "2026-05-04_23-04-13_postureON_clampON_air0.0"
+)
+
+
+def _flat_legs(legs):
+    return np.concatenate(
+        [
+            np.asarray(legs.FL).reshape(-1),
+            np.asarray(legs.FR).reshape(-1),
+            np.asarray(legs.RL).reshape(-1),
+            np.asarray(legs.RR).reshape(-1),
+        ],
+        axis=0,
+    ).astype(np.float32)
+
+
+def _leg_grouped_to_joint_grouped(q):
+    q = np.asarray(q, dtype=np.float32).reshape(4, 3)
+    return np.concatenate([q[:, 0], q[:, 1], q[:, 2]], axis=0)
+
+
+def _joint_grouped_to_leg_grouped(q):
+    q = np.asarray(q, dtype=np.float32).reshape(3, 4)
+    return q.T.reshape(12)
+
+
+def _legs_attr_from_flat(q):
+    q = np.asarray(q, dtype=np.float32).reshape(12)
+    legs = LegsAttr(*[np.zeros((1, 3), dtype=np.float32) for _ in range(4)])
+    legs.FL = q[0:3]
+    legs.FR = q[3:6]
+    legs.RL = q[6:9]
+    legs.RR = q[9:12]
+    return legs
+
+
+class _ActorMLP(nn.Module):
+    def __init__(self, state_dict):
+        super().__init__()
+        layer_ids = sorted(
+            {
+                int(key.split(".")[1])
+                for key in state_dict
+                if key.startswith("actor.") and key.endswith(".weight")
+            }
+        )
+        modules = []
+        for i, layer_id in enumerate(layer_ids):
+            weight = state_dict[f"actor.{layer_id}.weight"]
+            modules.append(nn.Linear(weight.shape[1], weight.shape[0]))
+            if i < len(layer_ids) - 1:
+                modules.append(nn.ELU())
+        self.actor = nn.Sequential(*modules)
+        self.actor.load_state_dict(
+            {
+                key.removeprefix("actor."): value
+                for key, value in state_dict.items()
+                if key.startswith("actor.")
+            }
+        )
+        self.input_dim = int(state_dict[f"actor.{layer_ids[0]}.weight"].shape[1])
+
+    def forward(self, obs):
+        return self.actor(obs)
+
+
+class _AdaptationMLP(nn.Module):
+    def __init__(self, input_dim, output_dim, hidden_dim=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
+
+    def forward(self, inputs):
+        return self.net(inputs)
+
+
+def _load_adaptation_network(path, device):
+    checkpoint = torch.load(path, map_location=device)
+    network = _AdaptationMLP(checkpoint["input_dim"], checkpoint["output_dim"]).to(device)
+    network.load_state_dict(checkpoint["model_state_dict"])
+    network.eval()
+    network.requires_grad_(False)
+    return network
+
+
+class Go2PosturePolicyWrapper:
+    """MuJoCo-side wrapper for a go2_posture IsaacLab policy.
+
+    This reconstructs the Go2-Posture-Direct-v0 actor observation from MuJoCo
+    state and converts policy residual actions into joint position targets:
+    processed_action = guide_action + action_scale * actor_action.
+    """
+
+    def __init__(self, env, run_dir=None, checkpoint=None, device=None, use_exported_adaptation=None):
+        self.run_dir = Path(run_dir or os.environ.get("GO2_POSTURE_RUN_DIR", DEFAULT_RUN_DIR)).expanduser()
+        self.checkpoint_path = Path(
+            checkpoint or os.environ.get("GO2_POSTURE_CHECKPOINT", self.run_dir / "model_9999.pt")
+        ).expanduser()
+        self.device = torch.device(device or os.environ.get("GO2_POSTURE_DEVICE", "cpu"))
+
+        with open(self.run_dir / "params" / "env.yaml", "r") as file:
+            self.cfg = yaml.unsafe_load(file)
+
+        ckpt = torch.load(self.checkpoint_path, map_location=self.device)
+        self.actor = _ActorMLP(ckpt["model_state_dict"]).to(self.device)
+        self.actor.eval()
+        self.actor.requires_grad_(False)
+
+        self.action_scale = float(self.cfg["action_scale"])
+        self.history_length = int(self.cfg["obs_history_length"])
+        self.base_obs_dim = int(self.cfg["base_observation_dim"])
+        self.adaptation_obs_dim = int(self.cfg["adaptation_observation_dim"])
+        self.use_rma = bool(self.cfg.get("use_rma", False))
+        self.use_concurrent_state_estimator = bool(self.cfg.get("use_concurrent_state_estimator", False))
+        self.RL_FREQ = 1.0 / (float(self.cfg["sim"]["dt"]) * float(self.cfg["decimation"]))
+        self.joint_order = os.environ.get("GO2_POSTURE_JOINT_ORDER", "joint_grouped").strip().lower()
+        if self.joint_order not in {"leg_grouped", "joint_grouped"}:
+            raise ValueError("GO2_POSTURE_JOINT_ORDER must be 'leg_grouped' or 'joint_grouped'")
+
+        actuator_cfg = self.cfg["robot"]["actuators"]["base_legs"]
+        self.Kp_walking = float(actuator_cfg.get("stiffness", 25.0))
+        self.Kd_walking = float(actuator_cfg.get("damping", 0.5))
+        self.Kp_stand_up_and_down = float(os.environ.get("GO2_POSTURE_STAND_KP", "25.0"))
+        self.Kd_stand_up_and_down = float(os.environ.get("GO2_POSTURE_STAND_KD", "2.0"))
+        self.effort_limit = float(actuator_cfg.get("effort_limit", np.inf))
+
+        self.default_joint_pos = np.array(
+            [
+                0.1, 0.8, -1.5,
+                -0.1, 0.8, -1.5,
+                0.1, 1.0, -1.5,
+                -0.1, 1.0, -1.5,
+            ],
+            dtype=np.float32,
+        )
+        self.default_joint_pos_policy = self._to_policy_order(self.default_joint_pos)
+        self.initial_base_height = float(self.cfg["robot"]["init_state"]["pos"][2])
+
+        self.obs_history = np.zeros((self.history_length, self.base_obs_dim), dtype=np.float32)
+        self.adaptation_history = np.zeros((self.history_length, self.adaptation_obs_dim), dtype=np.float32)
+        self.last_action = np.zeros(12, dtype=np.float32)
+        self.desired_joint_pos = _legs_attr_from_flat(self.default_joint_pos)
+
+        self.prev_vx = 0.0
+        self.a_long_filtered = 0.0
+        self.guide_roll = 0.0
+        self.guide_pitch = 0.0
+        self.guide_height = float(self.cfg["guide_h_nom"])
+        self.guide_action = self.default_joint_pos.copy()
+        self.guide_action_policy = self.default_joint_pos_policy.copy()
+
+        if use_exported_adaptation is None:
+            self.use_exported_adaptation = os.environ.get("GO2_POSTURE_USE_EXPORTED_ADAPTATION", "0") == "1"
+        else:
+            self.use_exported_adaptation = bool(use_exported_adaptation)
+        self.concurrent_state_estimator = None
+        self.rma_network = None
+        if self.use_exported_adaptation:
+            exported = self.run_dir / "exported"
+            if self.use_concurrent_state_estimator:
+                self.concurrent_state_estimator = _load_adaptation_network(
+                    exported / "concurrent_state_estimator.pth", self.device
+                )
+            if self.use_rma:
+                self.rma_network = _load_adaptation_network(exported / "rma.pth", self.device)
+
+        expected_dim = self.base_obs_dim * self.history_length + (11 if self.use_rma else 0)
+        if self.actor.input_dim != expected_dim:
+            raise ValueError(f"go2_posture actor input dim mismatch: actor={self.actor.input_dim} expected={expected_dim}")
+
+        print(
+            "[go2_posture] loaded "
+            f"{self.checkpoint_path} obs_dim={self.actor.input_dim} "
+            f"RL_FREQ={self.RL_FREQ:.1f}Hz Kp={self.Kp_walking:.2f} Kd={self.Kd_walking:.2f} "
+            f"joint_order={self.joint_order}"
+        )
+        if not self.use_exported_adaptation:
+            print("[go2_posture] MuJoCo oracle adaptation is enabled for sim-to-sim.")
+
+    def compute_control(
+        self,
+        base_pos,
+        base_quat_wxyz,
+        base_lin_vel,
+        base_ang_vel,
+        joints_pos,
+        joints_vel,
+        ref_base_lin_vel,
+        ref_base_ang_vel,
+        feet_contacts=None,
+    ):
+        base_lin_vel = np.asarray(base_lin_vel, dtype=np.float32).reshape(3)
+        base_ang_vel = np.asarray(base_ang_vel, dtype=np.float32).reshape(3)
+        command = np.array([ref_base_lin_vel[0], ref_base_lin_vel[1], ref_base_ang_vel[2]], dtype=np.float32)
+        joint_pos_leg_grouped = _flat_legs(joints_pos)
+        joint_vel_leg_grouped = _flat_legs(joints_vel)
+        joint_pos = self._to_policy_order(joint_pos_leg_grouped)
+        joint_vel = self._to_policy_order(joint_vel_leg_grouped)
+
+        self._update_guide(command, base_lin_vel[0])
+        guide_obs = np.array([self.guide_roll, self.guide_pitch, self.guide_height], dtype=np.float32)
+        adaptation_obs = np.concatenate(
+            [
+                base_ang_vel,
+                self._get_projected_gravity(base_quat_wxyz),
+                command,
+                joint_pos - self.default_joint_pos_policy,
+                joint_vel,
+                self.last_action,
+                guide_obs,
+            ]
+        ).astype(np.float32)
+        adaptation_obs_flat = self._append_adaptation_history(adaptation_obs)
+
+        if self.concurrent_state_estimator is not None:
+            with torch.no_grad():
+                root_lin_vel_obs = (
+                    self.concurrent_state_estimator(
+                        torch.tensor(adaptation_obs_flat, dtype=torch.float32, device=self.device).view(1, -1)
+                    )
+                    .squeeze(0)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+        else:
+            root_lin_vel_obs = base_lin_vel
+
+        obs_step = np.concatenate(
+            [
+                root_lin_vel_obs.astype(np.float32),
+                base_ang_vel,
+                self._get_projected_gravity(base_quat_wxyz),
+                command,
+                joint_pos - self.default_joint_pos_policy,
+                joint_vel,
+                self.last_action,
+                guide_obs,
+            ]
+        ).astype(np.float32)
+        obs = self._append_obs_history(obs_step)
+
+        if self.use_rma:
+            if self.rma_network is not None:
+                with torch.no_grad():
+                    rma_obs = (
+                        self.rma_network(
+                            torch.tensor(adaptation_obs_flat, dtype=torch.float32, device=self.device).view(1, -1)
+                        )
+                        .squeeze(0)
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+            else:
+                rma_obs = self._privileged_observation(base_lin_vel, base_pos, base_quat_wxyz, feet_contacts)
+            obs = np.concatenate([obs, rma_obs.astype(np.float32)], axis=0)
+
+        with torch.no_grad():
+            action = (
+                self.actor(torch.tensor(obs, dtype=torch.float32, device=self.device).view(1, -1))
+                .squeeze(0)
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32)
+            )
+
+        self.last_action = action.copy()
+        joint_target_policy = self.guide_action_policy + self.action_scale * action
+        joint_target = self._to_leg_grouped(joint_target_policy)
+        self.desired_joint_pos = _legs_attr_from_flat(joint_target)
+        return self.desired_joint_pos
+
+    def _append_obs_history(self, obs_step):
+        self.obs_history[:-1] = self.obs_history[1:]
+        self.obs_history[-1] = obs_step
+        return self.obs_history.reshape(-1).astype(np.float32)
+
+    def _append_adaptation_history(self, obs_step):
+        self.adaptation_history[:-1] = self.adaptation_history[1:]
+        self.adaptation_history[-1] = obs_step
+        return self.adaptation_history.reshape(-1).astype(np.float32)
+
+    def _update_guide(self, command, current_vx):
+        ctrl_dt = 1.0 / self.RL_FREQ
+        raw_a_long = (float(current_vx) - self.prev_vx) / ctrl_dt
+        alpha = float(self.cfg["guide_a_long_ema_alpha"])
+        self.a_long_filtered = alpha * raw_a_long + (1.0 - alpha) * self.a_long_filtered
+        self.prev_vx = float(current_vx)
+
+        g = float(self.cfg["guide_gravity"])
+        vel_mag = float(np.linalg.norm(command[:2]))
+        abs_wz = abs(float(command[2]))
+        a_lat = vel_mag * abs_wz
+
+        roll_raw = float(self.cfg["guide_k_roll"]) * np.arctan(a_lat / g)
+        roll_signed = -roll_raw if command[2] > 0.0 else roll_raw
+        if abs_wz < 1e-6 or vel_mag < 1e-6:
+            roll_signed = 0.0
+
+        pitch_raw = float(self.cfg["guide_k_pitch"]) * np.arctan(self.a_long_filtered / g)
+        pitch = -pitch_raw
+        height = (
+            float(self.cfg["guide_h_nom"])
+            - float(self.cfg["guide_kh_lat"]) * a_lat
+            - float(self.cfg["guide_kh_long"]) * abs(self.a_long_filtered)
+            - float(self.cfg["guide_kh_speed"]) * vel_mag**2
+        )
+        if bool(self.cfg.get("guide_clamp_enabled", True)):
+            roll_signed = float(np.clip(roll_signed, -float(self.cfg["guide_roll_max"]), float(self.cfg["guide_roll_max"])))
+            pitch = float(np.clip(pitch, -float(self.cfg["guide_pitch_max"]), float(self.cfg["guide_pitch_max"])))
+            height = float(np.clip(height, float(self.cfg["guide_h_min"]), float(self.cfg["guide_h_nom"])))
+
+        self.guide_roll = roll_signed
+        self.guide_pitch = pitch
+        self.guide_height = height
+        self.guide_action = self._posture_to_joint_targets(roll_signed, pitch, height)
+        self.guide_action_policy = self._to_policy_order(self.guide_action)
+
+    def _posture_to_joint_targets(self, roll, pitch, height):
+        delta = np.zeros(12, dtype=np.float32)
+        delta[[0, 3, 6, 9]] = float(self.cfg["k_roll_hip"]) * roll
+        delta[[1, 4]] = float(self.cfg["k_pitch_thigh"]) * pitch
+        delta[[7, 10]] = -float(self.cfg["k_pitch_thigh"]) * pitch
+
+        delta_h = height - float(self.cfg["guide_h_nom"])
+        delta[[1, 4, 7, 10]] += -float(self.cfg["k_h_thigh"]) * delta_h
+        delta[[2, 5, 8, 11]] = float(self.cfg["k_h_calf"]) * delta_h
+        return self.default_joint_pos + delta
+
+    def _to_policy_order(self, q_leg_grouped):
+        if self.joint_order == "joint_grouped":
+            return _leg_grouped_to_joint_grouped(q_leg_grouped)
+        return np.asarray(q_leg_grouped, dtype=np.float32).reshape(12)
+
+    def _to_leg_grouped(self, q_policy_order):
+        if self.joint_order == "joint_grouped":
+            return _joint_grouped_to_leg_grouped(q_policy_order)
+        return np.asarray(q_policy_order, dtype=np.float32).reshape(12)
+
+    def _privileged_observation(self, base_lin_vel, base_pos, base_quat_wxyz, feet_contacts):
+        roll, pitch = self._roll_pitch_from_quat(base_quat_wxyz)
+        base_height = float(np.asarray(base_pos).reshape(3)[2])
+        guide_errors = np.array(
+            [
+                roll - self.guide_roll,
+                pitch - self.guide_pitch,
+                base_height - self.guide_height,
+            ],
+            dtype=np.float32,
+        )
+        if feet_contacts is None:
+            contacts = np.zeros(4, dtype=np.float32)
+        else:
+            contacts = np.asarray(feet_contacts, dtype=np.float32).reshape(4)
+        return np.concatenate([base_lin_vel, [base_height], guide_errors, contacts]).astype(np.float32)
+
+    @staticmethod
+    def _roll_pitch_from_quat(q_wxyz):
+        q = np.asarray(q_wxyz, dtype=np.float32).reshape(4)
+        w, x, y, z = q / max(float(np.linalg.norm(q)), 1.0e-8)
+        roll = np.arctan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+        sin_pitch = 2.0 * (w * y - z * x)
+        pitch = np.arcsin(np.clip(sin_pitch, -1.0, 1.0))
+        return float(roll), float(pitch)
+
+    @staticmethod
+    def _get_projected_gravity(quat_wxyz):
+        q = np.asarray(quat_wxyz, dtype=np.float32).reshape(4)
+        w, x, y, z = q / max(float(np.linalg.norm(q)), 1.0e-8)
+        gravity = np.array([0.0, 0.0, -1.0], dtype=np.float32)
+        q_vec = np.array([x, y, z], dtype=np.float32)
+        projected = (
+            gravity * (2.0 * w * w - 1.0)
+            - 2.0 * w * np.cross(q_vec, gravity)
+            + 2.0 * q_vec * np.dot(q_vec, gravity)
+        )
+        return projected.astype(np.float32)
