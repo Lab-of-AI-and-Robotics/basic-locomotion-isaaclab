@@ -1,0 +1,319 @@
+Go2 posture guidance onboard deploy safety notes
+================================================
+
+Purpose
+-------
+This repo branch contains Go2 posture-guidance sim-to-sim and sim-to-real deploy code.
+The external unitree-ros2-dls workspace is NOT committed here, so onboard Codex should
+use this note to understand the safety mechanisms and ROS2/DDS assumptions.
+
+Current branch and policy bundles
+---------------------------------
+Branch:
+  posture_guidance_deploy
+
+Onboard policy bundles committed in this repo:
+  tested_policies/go2/go2_posture_guidance/2026-05-13_06-45-32_clampON_air0.5_ori0_ht5/
+  tested_policies/go2/go2_posture_guidance/2026-05-13_10-23-48_clampON_air2.0_ori01_ht5/
+
+Each bundle includes:
+  model_9999.pt
+  params/env.yaml
+  params/agent.yaml
+  exported/concurrent_state_estimator.pth
+
+These are RLvRL + concurrent state estimator policies:
+  adaptation_module: history_obs 240 -> z_hat 8
+  concurrent_state_estimator: history_obs 240 -> v_hat_b 3
+  actor_body input: single-step actor obs 51 + z_hat 8 = 59
+
+Critical: deploy must use exported adaptation/CSE
+------------------------------------------------
+For real deploy, the controller constructs Go2PosturePolicyWrapper with
+use_exported_adaptation=True. If running manually, keep:
+
+  GO2_POSTURE_USE_EXPORTED_ADAPTATION=1
+
+This loads:
+  exported/concurrent_state_estimator.pth
+
+Without this, sim-to-sim may use oracle MuJoCo/base velocity behavior and will not match
+real deploy.
+
+Network/observation safety alignment
+------------------------------------
+In deploy/go2_posture_policy_wrapper.py, the CSE velocity estimate is used in two places:
+
+1. Actor observation first 3 dimensions:
+     v_hat_b 3
+
+2. Posture guide computation:
+     current guide is computed from CSE v_hat_b and measured base angular velocity.
+
+Deploy order is intentionally aligned with training:
+  previous guide_obs
+    -> adaptation_obs history 240
+    -> concurrent_state_estimator
+    -> v_hat_b
+    -> current posture guide
+    -> actor obs 51
+    -> RLvRL adaptation_module history -> z_hat 8
+    -> actor_body([actor_obs, z_hat])
+
+This avoids using ROS/lidar/base-state linear velocity as the policy velocity input.
+External base velocity remains only as a fallback/debug/MuJoCo state value when CSE is not used.
+
+Main deploy files
+-----------------
+  deploy/go2_posture_policy_wrapper.py
+    Loads RLvRL checkpoints, adaptation_module, actor_body, and exported CSE/RMA networks.
+    Supports both older RLvRL history-actor obs and newer current-actor obs=51 checkpoints.
+
+  deploy/play_go2_posture_mujoco.py
+    Sim-to-sim MuJoCo runner with keyboard command support.
+
+  deploy/run_controller_ros2.py
+    Real deploy controller. Publishes dls2_interface/TrajectoryGenerator to /trajectory_generator.
+
+  deploy/go2_unitree_bridge_ros2.py
+    Optional local bridge between Unitree LowState/LowCmd and dls2_interface messages.
+    This file is useful if the onboard machine does not use the original unitree-ros2-dls runtime.
+
+  deploy/unitree_wireless_to_joy.py
+    Converts Unitree WirelessController to sensor_msgs/Joy with explicit button bit mapping.
+
+  deploy/go2_lidar_switch.py
+    Switches Unitree robot_state services such as obstacles_avoid, voxel_height_mapping,
+    unitree_lidar_slam, unitree_lidar.
+
+  deploy/go2_utlidar_spin_switch.py
+    Publishes "OFF"/"ON" to /utlidar/switch, mapped to Unitree DDS rt/utlidar/switch.
+
+Real deploy ROS2/DDS assumptions
+--------------------------------
+The repo does not include unitree-ros2-dls. On onboard, source the equivalent Unitree
+CycloneDDS/DLS workspace before running deploy, for example:
+
+  source /path/to/unitree-ros2-dls/ros2_connect.bash
+
+Expected message packages/types:
+  dls2_interface.msg:
+    BaseState
+    BlindState
+    Imu
+    TrajectoryGenerator
+
+  unitree_go.msg:
+    LowState
+    LowCmd
+    WirelessController
+
+  unitree_api.msg:
+    Request
+    Response
+
+Controller subscriptions in deploy/run_controller_ros2.py:
+  /base_state                         optional BaseState
+  pose_topic, default /utlidar/robot_pose
+  odom_topic, default /utlidar/robot_odom
+  blind_state
+  imu
+  joy
+
+Controller publisher:
+  /trajectory_generator
+
+For current CSE policies, /base_state and lidar pose/odom are not required for the policy
+velocity input. The controller still needs joint state and IMU. In our deploy command we
+usually set:
+
+  -p pose_topic:=/unused_lidar_pose
+  -p odom_topic:=/unused_lidar_odom
+  -p allow_zero_base_fallback:=true
+
+This avoids depending on lidar localization during policy execution.
+
+Safety mechanisms in run_controller_ros2.py
+------------------------------------------
+1. Required state gating
+   - Controller returns early until joint state is received.
+   - For go2_posture, IMU observation is required before RL control is computed.
+   - Lidar/base pose is not required if allow_zero_base_fallback is enabled.
+
+2. Joystick command filtering and clipping
+   Parameters:
+     joystick_filter
+     joy_max_forward_velocity
+     joy_max_lateral_velocity
+     joy_max_yaw_rate
+     joy_yaw_sign
+
+   Mapping:
+     axes[1] -> forward/backward
+     axes[0] -> lateral
+     axes[3] -> yaw
+
+   Commands are low-pass filtered, then clipped to the joy_max_* limits.
+
+3. Joystick timeout stop
+   Parameter:
+     joystick_timeout_sec
+
+   If joystick messages stop for longer than joystick_timeout_sec:
+     ref vx = 0
+     ref vy = 0
+     ref yaw = 0
+     joystick_timed_out = True
+
+4. Initial-pose hold for go2_posture
+   Parameters:
+     go2_posture_hold_initial_when_command_zero
+     go2_posture_hold_initial_on_joy_timeout
+     go2_posture_hold_initial_use_stand_gains
+     go2_posture_hold_max_joint_step
+     safe_rl_command_zero_threshold
+
+   If command is effectively zero, or joystick timed out, the controller does NOT run the
+   policy action. It commands the policy default/initial joint pose instead.
+
+   The target can be rate-limited by go2_posture_hold_max_joint_step to avoid joint jumps.
+
+5. RL activation blending
+   Parameter:
+     rl_activation_blend_time
+
+   When RL is activated, desired joint target is blended from current joint position to
+   policy target over rl_activation_blend_time seconds.
+
+6. Base velocity warmup and fallback protection
+   Parameters:
+     base_velocity_zero_warmup
+     base_lin_vel_clip
+     base_lin_vel_lpf_tau
+     base_state_freshness_sec
+
+   On RL activation, external base velocity is held at zero for base_velocity_zero_warmup.
+   External base velocity is clipped and low-pass filtered. For current CSE policies this
+   does not replace v_hat_b in actor obs, but it protects fallback/debug state paths.
+
+7. Sport-mode joystick activation toggle
+   Parameters:
+     sport_mode_l2_button_index
+     sport_mode_a_button_index
+     sport_mode_toggle_debounce_sec
+
+   L2 + A toggles RL activation:
+     first valid press  -> sport mode ON, RL policy activated
+     next valid press   -> sport mode OFF, RL policy deactivated
+
+   When RL is activated:
+     - controller logs: "Joystick L2+A: sport mode ON, RL policy activated."
+     - rl_activation_time is reset
+     - current joint position is saved as the blend start pose
+     - external base linear velocity is held at zero for base_velocity_zero_warmup
+     - policy target is blended from current joint position for rl_activation_blend_time
+
+   When RL is deactivated:
+     - controller logs: "Joystick L2+A: sport mode OFF, RL policy deactivated."
+     - controller returns to stand_up_and_down_actions target instead of policy output
+
+   sport_mode_toggle_debounce_sec prevents repeated toggles from one long press.
+
+8. Kill button is disabled by default
+   Parameter:
+     kill_button_index
+
+   Default is -1, so no joystick button kills HAL by accident. Only enable intentionally.
+
+9. Training gains are used for walking
+   Go2PosturePolicyWrapper reads:
+     robot.actuators.base_legs.stiffness
+     robot.actuators.base_legs.damping
+
+   Stand gains can be overridden by:
+     GO2_POSTURE_STAND_KP
+     GO2_POSTURE_STAND_KD
+
+Safety mechanisms in go2_unitree_bridge_ros2.py
+-----------------------------------------------
+This bridge is a local alternative/helpful reference if unitree-ros2-dls is not copied.
+
+1. Dry-run by default
+   Parameter:
+     publish_lowcmd
+
+   Default is False. The bridge will NOT publish LowCmd unless explicitly started with:
+     -p publish_lowcmd:=true
+
+2. Command timeout
+   Parameter:
+     timeout_sec
+
+   If /trajectory_generator is stale for longer than timeout_sec, bridge sends an idle
+   LowCmd rather than continuing stale commands.
+
+3. Per-tick joint target rate limit
+   Parameter:
+     max_position_step
+
+   Each commanded joint position is limited to max_position_step rad/tick relative to
+   previous command.
+
+4. Gain scaling
+   Parameters:
+     kp_scale
+     kd_scale
+
+   Allows reducing effective gains without changing the policy config.
+
+5. Optional /base_state publishing
+   Parameter:
+     publish_base_state
+
+   Can be disabled if another estimator publishes /base_state.
+
+LiDAR safety/isolation
+----------------------
+The deploy policy does not require lidar for the current RLvRL+CSE runs.
+
+To avoid onboard lidar/localization affecting deploy:
+  - Use unused pose/odom topics in run_controller_ros2.
+  - Optionally turn off lidar-related services:
+      python3 deploy/go2_lidar_switch.py --include-consumers
+  - Optionally stop UTLiDAR rotation/data:
+      python3 deploy/go2_utlidar_spin_switch.py --off
+
+go2_lidar_switch.py uses Unitree robot_state APIs:
+  /api/robot_state/request
+  /api/robot_state/response
+
+go2_utlidar_spin_switch.py publishes String "OFF"/"ON" to:
+  /utlidar/switch
+
+Recommended first real-deploy limits
+------------------------------------
+Even though the code supports max 2.0, first supported-body test should start lower:
+  joy_max_forward_velocity := 0.5
+  joy_max_lateral_velocity := 0.5
+  joy_max_yaw_rate := 0.5
+
+Then increase after verifying:
+  IMU orientation is correct
+  joint order is correct
+  CSE loads from exported/concurrent_state_estimator.pth
+  zero-command initial hold works
+  joystick timeout returns to initial hold
+  L2 + A activation toggles as expected
+
+Minimal deploy invariants
+-------------------------
+Before allowing the robot to move:
+  1. Source Unitree/DLS ROS2 environment.
+  2. Confirm /joy, imu, blind_state or joint messages arrive.
+  3. Confirm policy log prints:
+       rlvrl=True
+       rlvrl_actor_obs=current
+       obs_dim=51
+  4. Confirm GO2_POSTURE_USE_EXPORTED_ADAPTATION=1 or ControllerROS2 use_exported_adaptation=True.
+  5. Confirm zero joystick command holds initial pose.
+  6. Confirm lidar pose/odom are not required for this policy.
