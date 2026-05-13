@@ -8,6 +8,26 @@ from sensor_msgs.msg import Joy
 from unitree_go.msg import WirelessController
 
 
+BUTTON_BITS = {
+    "R1": 0,
+    "L1": 1,
+    "start": 2,
+    "select": 3,
+    "R2": 4,
+    "L2": 5,
+    "F1": 6,
+    "F2": 7,
+    "A": 8,
+    "B": 9,
+    "X": 10,
+    "Y": 11,
+    "up": 12,
+    "right": 13,
+    "down": 14,
+    "left": 15,
+}
+
+
 class UnitreeWirelessToJoy(Node):
     def __init__(self):
         super().__init__("unitree_wireless_to_joy")
@@ -32,7 +52,9 @@ class UnitreeWirelessToJoy(Node):
             1,
         )
 
-        self.get_logger().info("Bridging /wirelesscontroller to /joy")
+        self.get_logger().info(
+            "Bridging /wirelesscontroller to /joy with Unitree button bit mapping"
+        )
 
     def clean_axis(self, value, invert):
         if not math.isfinite(value):
@@ -54,8 +76,10 @@ class UnitreeWirelessToJoy(Node):
         # axes[0] for lateral motion, and axes[3] for yaw.
         joy.axes = [lx, ly, ry, rx]
 
-        # The controller currently reads buttons[8], so publish at least 9.
-        joy.buttons = [0] * 12
+        keys = int(msg.keys)
+        joy.buttons = [0] * 16
+        for bit in BUTTON_BITS.values():
+            joy.buttons[bit] = 1 if keys & (1 << bit) else 0
 
         self.pub.publish(joy)
 

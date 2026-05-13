@@ -32,7 +32,8 @@ def install_keyboard_command_callback(env):
     yaw_step = float(os.environ.get("MUJOCO_KEY_YAW_STEP", "0.2"))
     yaw_sign = float(os.environ.get("MUJOCO_YAW_SIGN", "-1.0"))
     max_lin = float(os.environ.get("MUJOCO_KEY_MAX_LIN", "2.0"))
-    max_yaw = float(os.environ.get("MUJOCO_KEY_MAX_YAW", "4.0"))
+    max_yaw = float(os.environ.get("MUJOCO_KEY_MAX_YAW", "2.0"))
+    env._keyboard_command_active = False
 
     def print_command():
         print(
@@ -71,6 +72,7 @@ def install_keyboard_command_callback(env):
             handled = False
 
         if handled and keycode != KEY_SPACE:
+            env._keyboard_command_active = True
             clamp_command()
             print_command()
 
@@ -154,11 +156,12 @@ if __name__ == "__main__":
             cmd_scale = min(1.0, env.step_num * simulation_dt / cmd_ramp_time)
         else:
             cmd_scale = 1.0
-        if "MUJOCO_CMD_X" in os.environ:
+        keyboard_command_active = bool(getattr(env, "_keyboard_command_active", False))
+        if "MUJOCO_CMD_X" in os.environ and not keyboard_command_active:
             env._ref_base_lin_vel_H[0] = cmd_scale * float(os.environ["MUJOCO_CMD_X"])
-        if "MUJOCO_CMD_Y" in os.environ:
+        if "MUJOCO_CMD_Y" in os.environ and not keyboard_command_active:
             env._ref_base_lin_vel_H[1] = cmd_scale * float(os.environ["MUJOCO_CMD_Y"])
-        if "MUJOCO_CMD_YAW" in os.environ:
+        if "MUJOCO_CMD_YAW" in os.environ and not keyboard_command_active:
             env._ref_base_ang_yaw_dot = cmd_yaw_sign * cmd_scale * float(os.environ["MUJOCO_CMD_YAW"])
 
         qpos, qvel = env.mjData.qpos, env.mjData.qvel

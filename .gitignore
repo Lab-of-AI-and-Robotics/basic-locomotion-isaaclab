@@ -43,3 +43,19 @@ deploy/ros2_ws/log/
 deploy/ros1_ws/build/
 deploy/ros1_ws/devel/
 deploy/ros1_ws/install/
+
+# Local deploy notes and generated experiment handoff bundles
+GO2_POSTURE_DEPLOY_COMMANDS.txt
+SAFE_RL_GO2_DEPLOY_COMMANDS.txt
+MUJOCO_LOG.TXT
+paper03_*_handoff_slim/
+safe_rl_basic_locomotion_handoff/
+
+# One-off local experiment launchers
+deploy/play_baseheight_*.sh
+deploy/play_new_model999_*.sh
+deploy/play_pct050_safe_rl_mujoco*.sh
+deploy/play_transfer_*.sh
+deploy/run_safe_rl_*.sh
+deploy/safe_rl_policy_wrapper.py
+deploy/*muse_go2_state_estimator.sh

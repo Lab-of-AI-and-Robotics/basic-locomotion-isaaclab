@@ -67,6 +67,17 @@ class ControllerROS2(Node):
         self.declare_parameter("base_state_freshness_sec", 0.1)
         self.declare_parameter("base_lin_vel_clip", 2.0)
         self.declare_parameter("base_lin_vel_lpf_tau", 0.05)
+        self.declare_parameter("safe_rl_hold_zero_when_command_zero", True)
+        self.declare_parameter("safe_rl_command_zero_threshold", 0.03)
+        self.declare_parameter("joystick_timeout_sec", 1.0)
+        self.declare_parameter("go2_posture_hold_initial_when_command_zero", True)
+        self.declare_parameter("go2_posture_hold_initial_on_joy_timeout", True)
+        self.declare_parameter("go2_posture_hold_initial_use_stand_gains", True)
+        self.declare_parameter("go2_posture_hold_max_joint_step", 0.05)
+        self.declare_parameter("sport_mode_l2_button_index", 5)
+        self.declare_parameter("sport_mode_a_button_index", 8)
+        self.declare_parameter("sport_mode_toggle_debounce_sec", 0.5)
+        self.declare_parameter("kill_button_index", -1)
         self.base_velocity_smoothing = max(0.0, min(1.0, float(self.get_parameter("base_velocity_smoothing").value)))
         self.base_velocity_zero_warmup = max(0.0, float(self.get_parameter("base_velocity_zero_warmup").value))
         self.allow_zero_base_fallback = bool(self.get_parameter("allow_zero_base_fallback").value)
@@ -79,6 +90,31 @@ class ControllerROS2(Node):
         self.base_state_freshness_sec = max(0.01, float(self.get_parameter("base_state_freshness_sec").value))
         self.base_lin_vel_clip = max(0.1, float(self.get_parameter("base_lin_vel_clip").value))
         self.base_lin_vel_lpf_tau = max(0.0, float(self.get_parameter("base_lin_vel_lpf_tau").value))
+        self.safe_rl_hold_zero_when_command_zero = bool(
+            self.get_parameter("safe_rl_hold_zero_when_command_zero").value
+        )
+        self.safe_rl_command_zero_threshold = max(
+            0.0, float(self.get_parameter("safe_rl_command_zero_threshold").value)
+        )
+        self.joystick_timeout_sec = max(0.0, float(self.get_parameter("joystick_timeout_sec").value))
+        self.go2_posture_hold_initial_when_command_zero = bool(
+            self.get_parameter("go2_posture_hold_initial_when_command_zero").value
+        )
+        self.go2_posture_hold_initial_on_joy_timeout = bool(
+            self.get_parameter("go2_posture_hold_initial_on_joy_timeout").value
+        )
+        self.go2_posture_hold_initial_use_stand_gains = bool(
+            self.get_parameter("go2_posture_hold_initial_use_stand_gains").value
+        )
+        self.go2_posture_hold_max_joint_step = max(
+            0.0, float(self.get_parameter("go2_posture_hold_max_joint_step").value)
+        )
+        self.sport_mode_l2_button_index = int(self.get_parameter("sport_mode_l2_button_index").value)
+        self.sport_mode_a_button_index = int(self.get_parameter("sport_mode_a_button_index").value)
+        self.sport_mode_toggle_debounce_sec = max(
+            0.0, float(self.get_parameter("sport_mode_toggle_debounce_sec").value)
+        )
+        self.kill_button_index = int(self.get_parameter("kill_button_index").value)
 
         # Mujoco env
         robot_name = config.robot
@@ -129,6 +165,11 @@ class ControllerROS2(Node):
         self.rl_activation_start_joint_pos = None
         self.last_missing_base_warning_time = 0.0
         self.zero_base_fallback_warned = False
+        self._sport_mode_combo_was_pressed = False
+        self._last_sport_mode_toggle_time = 0.0
+        self.joystick_timed_out = False
+        self.go2_posture_initial_hold_active = False
+        self._last_desired_joint_pos = None
 
         # Timing stuff
         self.loop_time = 0.002
@@ -215,23 +256,49 @@ class ControllerROS2(Node):
         """
 
         filter_joystick = self.joystick_filter
-        target_x = np.clip(msg.axes[1], -1.0, 1.0) * self.joy_max_forward_velocity
-        target_y = np.clip(msg.axes[0], -1.0, 1.0) * self.joy_max_lateral_velocity
-        target_yaw = self.joy_yaw_sign * np.clip(msg.axes[3], -1.0, 1.0) * self.joy_max_yaw_rate
+        axis_0 = msg.axes[0] if len(msg.axes) > 0 else 0.0
+        axis_1 = msg.axes[1] if len(msg.axes) > 1 else 0.0
+        axis_3 = msg.axes[3] if len(msg.axes) > 3 else 0.0
+        target_x = np.clip(axis_1, -1.0, 1.0) * self.joy_max_forward_velocity
+        target_y = np.clip(axis_0, -1.0, 1.0) * self.joy_max_lateral_velocity
+        target_yaw = self.joy_yaw_sign * np.clip(axis_3, -1.0, 1.0) * self.joy_max_yaw_rate
         self.env._ref_base_lin_vel_H[0] = self.env._ref_base_lin_vel_H[0]*filter_joystick + target_x*(1-filter_joystick)  # Forward/Backward
         self.env._ref_base_lin_vel_H[1] = self.env._ref_base_lin_vel_H[1]*filter_joystick + target_y*(1-filter_joystick)  # Left/Right
         self.env._ref_base_ang_yaw_dot = self.env._ref_base_ang_yaw_dot*filter_joystick + target_yaw*(1-filter_joystick)  # Yaw
 
         self.last_joy_time = time.time()
+        self.joystick_timed_out = False
 
-        #kill the node if the button is pressed
-        if msg.buttons[8] == 1:
+        sport_combo_pressed = (
+            self._joy_button_pressed(msg, self.sport_mode_l2_button_index)
+            and self._joy_button_pressed(msg, self.sport_mode_a_button_index)
+        )
+        now = time.time()
+        if (
+            sport_combo_pressed
+            and not self._sport_mode_combo_was_pressed
+            and now - self._last_sport_mode_toggle_time >= self.sport_mode_toggle_debounce_sec
+            and hasattr(self, "console")
+        ):
+            self.console.isRLActivated = not self.console.isRLActivated
+            self._last_sport_mode_toggle_time = now
+            if self.console.isRLActivated:
+                self.get_logger().warn("Joystick L2+A: sport mode ON, RL policy activated.")
+            else:
+                self.get_logger().warn("Joystick L2+A: sport mode OFF, RL policy deactivated.")
+        self._sport_mode_combo_was_pressed = sport_combo_pressed
+
+        if self._joy_button_pressed(msg, self.kill_button_index):
             self.get_logger().info("Joystick button pressed, shutting down the node.") 
             # This will kill the robot hal
             os.system("kill -9 $(ps -u | grep -m 1 hal | grep -o \"^[^ ]* *[0-9]*\" | grep -o \"[0-9]*\")")
             # This will kill the process running this script
             os.system("pkill -f play_ros2.py") 
             exit(0)
+
+
+    def _joy_button_pressed(self, msg, button_index):
+        return 0 <= button_index < len(msg.buttons) and msg.buttons[button_index] == 1
 
 
     def get_base_state_callback(self, msg):
@@ -534,12 +601,17 @@ class ControllerROS2(Node):
         mujoco.mj_forward(self.env.mjModel, self.env.mjData) 
         
         # Safety check for joystick timeout
-        if(self.last_joy_time is not None and time.time() - self.last_joy_time > 1.0):
+        if(
+            self.last_joy_time is not None
+            and self.joystick_timeout_sec > 0.0
+            and time.time() - self.last_joy_time > self.joystick_timeout_sec
+        ):
             self.env._ref_base_lin_vel_H[0] = 0.0
             self.env._ref_base_lin_vel_H[1] = 0.0
             self.env._ref_base_ang_yaw_dot = 0.0
             print("Joystick timeout, stopping the robot")
             self.last_joy_time = None
+            self.joystick_timed_out = True
 
         self.env._ref_base_lin_vel_H[0] = np.clip(
             self.env._ref_base_lin_vel_H[0],
@@ -589,10 +661,19 @@ class ControllerROS2(Node):
         else:
             ref_base_lin_vel, ref_base_ang_vel = env.target_base_vel()
 
+        if config.policy_backend == "safe_rl":
+            self._update_safe_rl_zero_command_hold(locomotion_policy, ref_base_lin_vel, ref_base_ang_vel)
 
+        go2_posture_hold_initial = self._go2_posture_should_hold_initial(ref_base_lin_vel, ref_base_ang_vel)
         if(self.console.isRLActivated):
 
-            if config.policy_backend == "go2_posture":
+            if config.policy_backend == "go2_posture" and go2_posture_hold_initial:
+                desired_joint_pos = self._go2_posture_initial_target(locomotion_policy)
+                if self.go2_posture_hold_max_joint_step > 0.0:
+                    desired_joint_pos = self._limit_leg_target_step(
+                        desired_joint_pos, self.go2_posture_hold_max_joint_step
+                    )
+            elif config.policy_backend == "go2_posture":
                 desired_joint_pos = locomotion_policy.compute_control(
                         base_pos=base_pos,
                         base_quat_wxyz=base_quat_wxyz,
@@ -628,8 +709,12 @@ class ControllerROS2(Node):
                 )
             
             # Impedence Loop
-            Kp = locomotion_policy.Kp_walking
-            Kd = locomotion_policy.Kd_walking
+            if go2_posture_hold_initial and self.go2_posture_hold_initial_use_stand_gains:
+                Kp = locomotion_policy.Kp_stand_up_and_down
+                Kd = locomotion_policy.Kd_stand_up_and_down
+            else:
+                Kp = locomotion_policy.Kp_walking
+                Kd = locomotion_policy.Kd_walking
 
 
         else:
@@ -652,6 +737,7 @@ class ControllerROS2(Node):
         trajectory_generator_msg.joints_velocity = np.zeros(12).tolist()
         trajectory_generator_msg.kp = (np.ones(12) * Kp).tolist()
         trajectory_generator_msg.kd = (np.ones(12) * Kd).tolist()
+        self._last_desired_joint_pos = self._flat_joints_from_legs_attr(desired_joint_pos)
 
         self.publisher_trajectory_generator.publish(trajectory_generator_msg)
         
@@ -673,6 +759,79 @@ class ControllerROS2(Node):
         legs.RL = joints[6:9]
         legs.RR = joints[9:12]
         return legs
+
+    def _update_safe_rl_zero_command_hold(self, locomotion_policy, ref_base_lin_vel, ref_base_ang_vel):
+        if not hasattr(locomotion_policy, "hold_zero_action"):
+            return
+        static_hold = bool(getattr(locomotion_policy, "static_hold_zero_action", False))
+        command_norm = max(
+            abs(float(ref_base_lin_vel[0])),
+            abs(float(ref_base_lin_vel[1])),
+            abs(float(ref_base_ang_vel[2])),
+        )
+        command_is_zero = command_norm < self.safe_rl_command_zero_threshold
+        hold = static_hold or (self.safe_rl_hold_zero_when_command_zero and command_is_zero)
+        if hold != bool(locomotion_policy.hold_zero_action):
+            if hold:
+                self.get_logger().info("Safe RL holding zero latent action because joystick command is zero.")
+            else:
+                self.get_logger().info("Safe RL using actor action because joystick command is nonzero.")
+        locomotion_policy.hold_zero_action = hold
+
+
+    def _go2_posture_should_hold_initial(self, ref_base_lin_vel, ref_base_ang_vel):
+        if config.policy_backend != "go2_posture" or not self.console.isRLActivated:
+            self.go2_posture_initial_hold_active = False
+            return False
+        if not self.go2_posture_hold_initial_when_command_zero:
+            self.go2_posture_initial_hold_active = False
+            return False
+
+        command_norm = max(
+            abs(float(ref_base_lin_vel[0])),
+            abs(float(ref_base_lin_vel[1])),
+            abs(float(ref_base_ang_vel[2])),
+        )
+        command_is_zero = command_norm < self.safe_rl_command_zero_threshold
+        hold = command_is_zero or (
+            self.go2_posture_hold_initial_on_joy_timeout and self.joystick_timed_out
+        )
+        if hold != self.go2_posture_initial_hold_active:
+            if hold:
+                self.get_logger().warn(
+                    "Go2 posture holding initial pose because command is zero or joystick timed out."
+                )
+            else:
+                self.get_logger().warn("Go2 posture leaving initial-pose hold; policy command is active.")
+        self.go2_posture_initial_hold_active = hold
+        return hold
+
+
+    def _go2_posture_initial_target(self, locomotion_policy):
+        if hasattr(locomotion_policy, "default_joint_pos"):
+            return self._legs_attr_from_flat_joints(locomotion_policy.default_joint_pos)
+        return self._legs_attr_from_flat_joints(self.joint_positions)
+
+
+    def _flat_joints_from_legs_attr(self, joints):
+        return np.concatenate(
+            [
+                np.asarray(joints.FL).reshape(-1),
+                np.asarray(joints.FR).reshape(-1),
+                np.asarray(joints.RL).reshape(-1),
+                np.asarray(joints.RR).reshape(-1),
+            ],
+            axis=0,
+        ).astype(np.float32)
+
+
+    def _limit_leg_target_step(self, target, max_step):
+        if self._last_desired_joint_pos is None:
+            return target
+        target_flat = self._flat_joints_from_legs_attr(target)
+        previous = np.asarray(self._last_desired_joint_pos, dtype=np.float32).reshape(12)
+        limited = previous + np.clip(target_flat - previous, -max_step, max_step)
+        return self._legs_attr_from_flat_joints(limited)
 
 
     def _blend_leg_targets(self, start, target, alpha):

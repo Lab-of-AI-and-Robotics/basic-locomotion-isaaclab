@@ -7,6 +7,7 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 from geometry_msgs.msg import PoseStamped
+from nav_msgs.msg import Odometry
 
 from dls2_interface.msg import BaseState, BlindState, Imu, TrajectoryGenerator
 from unitree_go.msg import LowCmd, LowState
@@ -32,17 +33,22 @@ class Go2UnitreeBridge(Node):
         self.declare_parameter("lowcmd_topic", "/lowcmd")
         self.declare_parameter("lowstate_topic", "/lowstate")
         self.declare_parameter("pose_topic", "/utlidar/robot_pose")
+        self.declare_parameter("odom_topic", "/utlidar/robot_odom")
         self.declare_parameter("timeout_sec", 0.25)
         self.declare_parameter("kp_scale", 1.0)
         self.declare_parameter("kd_scale", 1.0)
         self.declare_parameter("max_position_step", 0.08)
+        self.declare_parameter("base_velocity_smoothing", 0.6)
+        self.declare_parameter("publish_base_state", True)
 
         self.publish_lowcmd = self.get_parameter("publish_lowcmd").value
+        self.publish_base_state = bool(self.get_parameter("publish_base_state").value)
         self.lowcmd_topic = self.get_parameter("lowcmd_topic").value
         self.timeout_sec = float(self.get_parameter("timeout_sec").value)
         self.kp_scale = float(self.get_parameter("kp_scale").value)
         self.kd_scale = float(self.get_parameter("kd_scale").value)
         self.max_position_step = float(self.get_parameter("max_position_step").value)
+        self.base_velocity_smoothing = max(0.0, min(1.0, float(self.get_parameter("base_velocity_smoothing").value)))
 
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -60,6 +66,10 @@ class Go2UnitreeBridge(Node):
 
         self.lowstate = None
         self.pose = None
+        self.odom = None
+        self.base_linear_velocity = _zeros(3)
+        self.previous_pose_position = None
+        self.previous_pose_time = None
         self.last_traj_time = 0.0
         self.latest_cmd = self._make_idle_lowcmd()
         self.last_commanded_position = None
@@ -81,6 +91,12 @@ class Go2UnitreeBridge(Node):
             sensor_qos,
         )
         self.create_subscription(
+            Odometry,
+            self.get_parameter("odom_topic").value,
+            self.odom_cb,
+            sensor_qos,
+        )
+        self.create_subscription(
             TrajectoryGenerator,
             "/trajectory_generator",
             self.trajectory_cb,
@@ -96,6 +112,8 @@ class Go2UnitreeBridge(Node):
             f"Command safety: kp_scale={self.kp_scale}, kd_scale={self.kd_scale}, "
             f"max_position_step={self.max_position_step} rad/tick"
         )
+        if not self.publish_base_state:
+            self.get_logger().warn("Bridge /base_state publishing is disabled; expecting another estimator such as MUSE.")
         if not self.publish_lowcmd:
             self.get_logger().warn("Use --ros-args -p publish_lowcmd:=true only when the robot is safely supported.")
 
@@ -139,25 +157,17 @@ class Go2UnitreeBridge(Node):
         imu.linear_acceleration_covariance = _zeros(9)
         self.imu_pub.publish(imu)
 
-        if self.pose is not None:
+        base_pose = self._latest_base_pose()
+        if self.publish_base_state and base_pose is not None:
             base = BaseState()
             base.frame_id = "go2"
             base.sequence_id = int(msg.tick)
             base.timestamp = now
             base.robot_name = "go2"
-            base.pose.position = [
-                float(self.pose.pose.position.x),
-                float(self.pose.pose.position.y),
-                float(self.pose.pose.position.z),
-            ]
+            base.pose.position = base_pose["position"]
             # DLS message uses xyzw for /base_state; run_controller rolls it to wxyz.
-            base.pose.orientation = [
-                float(self.pose.pose.orientation.x),
-                float(self.pose.pose.orientation.y),
-                float(self.pose.pose.orientation.z),
-                float(self.pose.pose.orientation.w),
-            ]
-            base.velocity.linear = _zeros(3)
+            base.pose.orientation = base_pose["orientation"]
+            base.velocity.linear = self.base_linear_velocity
             base.velocity.angular = [float(x) for x in msg.imu_state.gyroscope]
             base.acceleration.linear = [float(x) for x in msg.imu_state.accelerometer]
             base.acceleration.angular = _zeros(3)
@@ -166,6 +176,78 @@ class Go2UnitreeBridge(Node):
 
     def pose_cb(self, msg):
         self.pose = msg
+        current_position = [
+            float(msg.pose.position.x),
+            float(msg.pose.position.y),
+            float(msg.pose.position.z),
+        ]
+        current_time = self._pose_time_sec(msg)
+        self._update_base_linear_velocity(current_position, current_time)
+
+    def odom_cb(self, msg):
+        self.odom = msg
+        current_position = [
+            float(msg.pose.pose.position.x),
+            float(msg.pose.pose.position.y),
+            float(msg.pose.pose.position.z),
+        ]
+        current_time = self._pose_time_sec(msg)
+        self._update_base_linear_velocity(current_position, current_time)
+
+    def _update_base_linear_velocity(self, current_position, current_time):
+        if self.previous_pose_position is not None and self.previous_pose_time is not None:
+            dt = current_time - self.previous_pose_time
+            if dt > 1e-4:
+                raw_velocity = [
+                    (current_position[i] - self.previous_pose_position[i]) / dt
+                    for i in range(3)
+                ]
+                smoothing = self.base_velocity_smoothing
+                self.base_linear_velocity = [
+                    smoothing * self.base_linear_velocity[i] + (1.0 - smoothing) * raw_velocity[i]
+                    for i in range(3)
+                ]
+
+        self.previous_pose_position = current_position
+        self.previous_pose_time = current_time
+
+    def _latest_base_pose(self):
+        if self.odom is not None:
+            return {
+                "position": [
+                    float(self.odom.pose.pose.position.x),
+                    float(self.odom.pose.pose.position.y),
+                    float(self.odom.pose.pose.position.z),
+                ],
+                "orientation": [
+                    float(self.odom.pose.pose.orientation.x),
+                    float(self.odom.pose.pose.orientation.y),
+                    float(self.odom.pose.pose.orientation.z),
+                    float(self.odom.pose.pose.orientation.w),
+                ],
+            }
+        if self.pose is not None:
+            return {
+                "position": [
+                    float(self.pose.pose.position.x),
+                    float(self.pose.pose.position.y),
+                    float(self.pose.pose.position.z),
+                ],
+                "orientation": [
+                    float(self.pose.pose.orientation.x),
+                    float(self.pose.pose.orientation.y),
+                    float(self.pose.pose.orientation.z),
+                    float(self.pose.pose.orientation.w),
+                ],
+            }
+        return None
+
+    def _pose_time_sec(self, msg):
+        stamp = msg.header.stamp
+        stamp_time = float(stamp.sec) + float(stamp.nanosec) * 1e-9
+        if stamp_time > 0.0:
+            return stamp_time
+        return time.time()
 
     def trajectory_cb(self, msg):
         cmd = self._make_idle_lowcmd()
