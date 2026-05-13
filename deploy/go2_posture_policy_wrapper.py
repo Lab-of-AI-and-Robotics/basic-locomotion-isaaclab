@@ -1,5 +1,54 @@
 import os
+import sys
 from pathlib import Path
+
+
+def _ensure_libgomp_preload():
+    if os.environ.get("GO2_LIBGOMP_PRELOAD_READY") == "1":
+        return
+    try:
+        machine = os.uname().machine.lower()
+    except AttributeError:
+        machine = ""
+    if "aarch64" not in machine and "arm64" not in machine:
+        os.environ["GO2_LIBGOMP_PRELOAD_READY"] = "1"
+        return
+
+    preload = os.environ.get("LD_PRELOAD", "")
+    gomp_candidates = []
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        gomp_candidates.append(os.path.join(conda_prefix, "lib", "libgomp.so.1"))
+    gomp_candidates.append("/usr/lib/aarch64-linux-gnu/libgomp.so.1")
+    gldispatch_candidates = [
+        "/lib/aarch64-linux-gnu/libGLdispatch.so.0",
+        "/usr/lib/aarch64-linux-gnu/libGLdispatch.so.0",
+    ]
+
+    libs_to_preload = []
+    for candidate in gomp_candidates:
+        if candidate and os.path.exists(candidate):
+            libs_to_preload.append(candidate)
+            break
+    for candidate in gldispatch_candidates:
+        if candidate and os.path.exists(candidate):
+            libs_to_preload.append(candidate)
+            break
+
+    if all(candidate in preload.split() for candidate in libs_to_preload):
+        os.environ["GO2_LIBGOMP_PRELOAD_READY"] = "1"
+        return
+
+    if libs_to_preload:
+        env = os.environ.copy()
+        env["GO2_LIBGOMP_PRELOAD_READY"] = "1"
+        env["LD_PRELOAD"] = " ".join(libs_to_preload + ([preload] if preload else []))
+        os.execvpe(sys.executable, [sys.executable] + sys.argv, env)
+
+    os.environ["GO2_LIBGOMP_PRELOAD_READY"] = "1"
+
+
+_ensure_libgomp_preload()
 
 import numpy as np
 import torch
@@ -20,6 +69,12 @@ DEFAULT_RUN_NAME = os.environ.get(
     "2026-05-04_23-04-13_postureON_clampON_air0.0",
 )
 DEFAULT_RUN_DIR = DEFAULT_POLICY_ROOT / DEFAULT_RUN_NAME
+
+
+def _strip_prefix(text, prefix):
+    if text.startswith(prefix):
+        return text[len(prefix) :]
+    return text
 
 
 def _flat_legs(legs):
@@ -73,7 +128,7 @@ class _ActorMLP(nn.Module):
         self.actor = nn.Sequential(*modules)
         self.actor.load_state_dict(
             {
-                key.removeprefix("actor."): value
+                key[len("actor.") :]: value
                 for key, value in state_dict.items()
                 if key.startswith("actor.")
             }
@@ -82,6 +137,73 @@ class _ActorMLP(nn.Module):
 
     def forward(self, obs):
         return self.actor(obs)
+
+
+class _PrefixedSequentialMLP(nn.Module):
+    def __init__(self, state_dict, prefix):
+        super().__init__()
+        layer_ids = sorted(
+            {
+                int(_strip_prefix(key, prefix).split(".")[0])
+                for key in state_dict
+                if key.startswith(prefix) and key.endswith(".weight")
+            }
+        )
+        if not layer_ids:
+            raise ValueError("Cannot find MLP weights with prefix=%r" % (prefix,))
+
+        modules = []
+        for i, layer_id in enumerate(layer_ids):
+            weight = state_dict[f"{prefix}{layer_id}.weight"]
+            modules.append(nn.Linear(weight.shape[1], weight.shape[0]))
+            if i < len(layer_ids) - 1:
+                modules.append(nn.ELU())
+        self.net = nn.Sequential(*modules)
+        self.net.load_state_dict(
+            {
+                _strip_prefix(key, prefix): value
+                for key, value in state_dict.items()
+                if key.startswith(prefix)
+            }
+        )
+        first_weight = state_dict[f"{prefix}{layer_ids[0]}.weight"]
+        last_weight = state_dict[f"{prefix}{layer_ids[-1]}.weight"]
+        self.input_dim = int(first_weight.shape[1])
+        self.output_dim = int(last_weight.shape[0])
+
+    def forward(self, inputs):
+        return self.net(inputs)
+
+
+class _RLvRLActorMLP(nn.Module):
+    def __init__(self, state_dict, actor_obs_dim, history_obs_dim, latent_dim):
+        super().__init__()
+        self.adaptation_module = _PrefixedSequentialMLP(state_dict, "adaptation_module.")
+        self.actor_body = _PrefixedSequentialMLP(state_dict, "actor_body.")
+        self.input_dim = int(actor_obs_dim)
+        self.history_input_dim = int(history_obs_dim)
+        self.latent_dim = int(latent_dim)
+
+        if self.adaptation_module.input_dim != self.history_input_dim:
+            raise ValueError(
+                "RLvRL adaptation input dim mismatch: "
+                f"checkpoint={self.adaptation_module.input_dim} expected={self.history_input_dim}"
+            )
+        if self.adaptation_module.output_dim != self.latent_dim:
+            raise ValueError(
+                "RLvRL latent dim mismatch: "
+                f"checkpoint={self.adaptation_module.output_dim} expected={self.latent_dim}"
+            )
+        expected_actor_body_input = self.input_dim + self.latent_dim
+        if self.actor_body.input_dim != expected_actor_body_input:
+            raise ValueError(
+                "RLvRL actor body input dim mismatch: "
+                f"checkpoint={self.actor_body.input_dim} expected={expected_actor_body_input}"
+            )
+
+    def forward(self, obs, history_obs):
+        latent = self.adaptation_module(history_obs)
+        return self.actor_body(torch.cat((obs, latent), dim=-1))
 
 
 class _AdaptationMLP(nn.Module):
@@ -128,21 +250,31 @@ class Go2PosturePolicyWrapper:
         with open(self.run_dir / "params" / "env.yaml", "r") as file:
             self.cfg = yaml.unsafe_load(file)
 
-        ckpt = torch.load(self.checkpoint_path, map_location=self.device)
-        self.actor = _ActorMLP(ckpt["model_state_dict"]).to(self.device)
-        self.actor.eval()
-        self.actor.requires_grad_(False)
-
         self.action_scale = float(self.cfg["action_scale"])
         self.history_length = int(self.cfg["obs_history_length"])
         self.base_obs_dim = int(self.cfg["base_observation_dim"])
         self.adaptation_obs_dim = int(self.cfg["adaptation_observation_dim"])
         self.use_rma = bool(self.cfg.get("use_rma", False))
         self.use_concurrent_state_estimator = bool(self.cfg.get("use_concurrent_state_estimator", False))
+        self.use_rlvrl_teacher_student = bool(self.cfg.get("use_rlvrl_teacher_student", False))
         self.RL_FREQ = 1.0 / (float(self.cfg["sim"]["dt"]) * float(self.cfg["decimation"]))
         self.joint_order = os.environ.get("GO2_POSTURE_JOINT_ORDER", "joint_grouped").strip().lower()
         if self.joint_order not in {"leg_grouped", "joint_grouped"}:
             raise ValueError("GO2_POSTURE_JOINT_ORDER must be 'leg_grouped' or 'joint_grouped'")
+
+        ckpt = torch.load(self.checkpoint_path, map_location=self.device)
+        state_dict = ckpt["model_state_dict"]
+        if self.use_rlvrl_teacher_student:
+            self.actor = _RLvRLActorMLP(
+                state_dict,
+                actor_obs_dim=int(self.cfg["rlvrl_actor_observation_dim"]),
+                history_obs_dim=int(self.cfg["rlvrl_history_observation_dim"]),
+                latent_dim=int(self.cfg["rlvrl_latent_dim"]),
+            ).to(self.device)
+        else:
+            self.actor = _ActorMLP(state_dict).to(self.device)
+        self.actor.eval()
+        self.actor.requires_grad_(False)
 
         actuator_cfg = self.cfg["robot"]["actuators"]["base_legs"]
         self.Kp_walking = float(actuator_cfg.get("stiffness", 25.0))
@@ -167,6 +299,8 @@ class Go2PosturePolicyWrapper:
         self.adaptation_history = np.zeros((self.history_length, self.adaptation_obs_dim), dtype=np.float32)
         self.last_action = np.zeros(12, dtype=np.float32)
         self.desired_joint_pos = _legs_attr_from_flat(self.default_joint_pos)
+        self.policy_obs_dim = self.base_obs_dim * self.history_length + (11 if self.use_rma else 0)
+        self.rlvrl_actor_obs_mode = None
 
         self.prev_vx = 0.0
         self.a_long_filtered = 0.0
@@ -191,15 +325,33 @@ class Go2PosturePolicyWrapper:
             if self.use_rma:
                 self.rma_network = _load_adaptation_network(exported / "rma.pth", self.device)
 
-        expected_dim = self.base_obs_dim * self.history_length + (11 if self.use_rma else 0)
-        if self.actor.input_dim != expected_dim:
-            raise ValueError(f"go2_posture actor input dim mismatch: actor={self.actor.input_dim} expected={expected_dim}")
+        if self.use_rlvrl_teacher_student:
+            expected_history_dim = self.adaptation_obs_dim * self.history_length
+            if self.actor.history_input_dim != expected_history_dim:
+                raise ValueError(
+                    "go2_posture RLvRL history input dim mismatch: "
+                    f"actor={self.actor.history_input_dim} expected={expected_history_dim}"
+                )
+            if self.actor.input_dim == self.base_obs_dim:
+                self.rlvrl_actor_obs_mode = "current"
+            elif self.actor.input_dim == self.policy_obs_dim:
+                self.rlvrl_actor_obs_mode = "history"
+            else:
+                raise ValueError(
+                    "go2_posture RLvRL actor obs dim is unsupported by this wrapper: "
+                    f"actor={self.actor.input_dim} current={self.base_obs_dim} history={self.policy_obs_dim}"
+                )
+        elif self.actor.input_dim != self.policy_obs_dim:
+            raise ValueError(
+                f"go2_posture actor input dim mismatch: actor={self.actor.input_dim} expected={self.policy_obs_dim}"
+            )
 
         print(
             "[go2_posture] loaded "
             f"{self.checkpoint_path} obs_dim={self.actor.input_dim} "
             f"RL_FREQ={self.RL_FREQ:.1f}Hz Kp={self.Kp_walking:.2f} Kd={self.Kd_walking:.2f} "
-            f"joint_order={self.joint_order}"
+            f"joint_order={self.joint_order} rlvrl={self.use_rlvrl_teacher_student}"
+            f" rlvrl_actor_obs={self.rlvrl_actor_obs_mode}"
         )
         if not self.use_exported_adaptation:
             print("[go2_posture] MuJoCo oracle adaptation is enabled for sim-to-sim.")
@@ -224,8 +376,7 @@ class Go2PosturePolicyWrapper:
         joint_pos = self._to_policy_order(joint_pos_leg_grouped)
         joint_vel = self._to_policy_order(joint_vel_leg_grouped)
 
-        self._update_guide(command, base_lin_vel[0])
-        guide_obs = np.array([self.guide_roll, self.guide_pitch, self.guide_height], dtype=np.float32)
+        prev_guide_obs = np.array([self.guide_roll, self.guide_pitch, self.guide_height], dtype=np.float32)
         adaptation_obs = np.concatenate(
             [
                 base_ang_vel,
@@ -234,7 +385,7 @@ class Go2PosturePolicyWrapper:
                 joint_pos - self.default_joint_pos_policy,
                 joint_vel,
                 self.last_action,
-                guide_obs,
+                prev_guide_obs,
             ]
         ).astype(np.float32)
         adaptation_obs_flat = self._append_adaptation_history(adaptation_obs)
@@ -252,6 +403,9 @@ class Go2PosturePolicyWrapper:
                 )
         else:
             root_lin_vel_obs = base_lin_vel
+
+        self._update_guide(command, root_lin_vel_obs[0], velocity_b=root_lin_vel_obs, omega_b=base_ang_vel)
+        guide_obs = np.array([self.guide_roll, self.guide_pitch, self.guide_height], dtype=np.float32)
 
         obs_step = np.concatenate(
             [
@@ -284,14 +438,15 @@ class Go2PosturePolicyWrapper:
             obs = np.concatenate([obs, rma_obs.astype(np.float32)], axis=0)
 
         with torch.no_grad():
-            action = (
-                self.actor(torch.tensor(obs, dtype=torch.float32, device=self.device).view(1, -1))
-                .squeeze(0)
-                .detach()
-                .cpu()
-                .numpy()
-                .astype(np.float32)
-            )
+            if self.use_rlvrl_teacher_student:
+                actor_obs = obs_step if self.rlvrl_actor_obs_mode == "current" else obs
+                obs_t = torch.tensor(actor_obs, dtype=torch.float32, device=self.device).view(1, -1)
+                history_t = torch.tensor(adaptation_obs_flat, dtype=torch.float32, device=self.device).view(1, -1)
+                action_t = self.actor(obs_t, history_t)
+            else:
+                obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).view(1, -1)
+                action_t = self.actor(obs_t)
+            action = action_t.squeeze(0).detach().cpu().numpy().astype(np.float32)
 
         self.last_action = action.copy()
         joint_target_policy = self.guide_action_policy + self.action_scale * action
@@ -309,7 +464,7 @@ class Go2PosturePolicyWrapper:
         self.adaptation_history[-1] = obs_step
         return self.adaptation_history.reshape(-1).astype(np.float32)
 
-    def _update_guide(self, command, current_vx):
+    def _update_guide(self, command, current_vx, velocity_b=None, omega_b=None):
         ctrl_dt = 1.0 / self.RL_FREQ
         raw_a_long = (float(current_vx) - self.prev_vx) / ctrl_dt
         alpha = float(self.cfg["guide_a_long_ema_alpha"])
@@ -317,12 +472,15 @@ class Go2PosturePolicyWrapper:
         self.prev_vx = float(current_vx)
 
         g = float(self.cfg["guide_gravity"])
-        vel_mag = float(np.linalg.norm(command[:2]))
-        abs_wz = abs(float(command[2]))
+        velocity_xy = np.asarray(command[:2] if velocity_b is None else velocity_b[:2], dtype=np.float32)
+        yaw_rate = float(command[2] if omega_b is None else omega_b[2])
+        vel_mag = float(np.linalg.norm(velocity_xy))
+        abs_wz = abs(yaw_rate)
         a_lat = vel_mag * abs_wz
 
         roll_raw = float(self.cfg["guide_k_roll"]) * np.arctan(a_lat / g)
-        roll_signed = -roll_raw if command[2] > 0.0 else roll_raw
+        turn_sign = float(command[2]) if abs(float(command[2])) > 1e-6 else yaw_rate
+        roll_signed = -roll_raw if turn_sign > 0.0 else roll_raw
         if abs_wz < 1e-6 or vel_mag < 1e-6:
             roll_signed = 0.0
 

@@ -8,6 +8,54 @@ dir_path = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(os.path.join(dir_path, ".."))
 
 
+def _ensure_libgomp_preload():
+    if os.environ.get("GO2_LIBGOMP_PRELOAD_READY") == "1":
+        return
+    try:
+        machine = os.uname().machine.lower()
+    except AttributeError:
+        machine = ""
+    if "aarch64" not in machine and "arm64" not in machine:
+        os.environ["GO2_LIBGOMP_PRELOAD_READY"] = "1"
+        return
+
+    preload = os.environ.get("LD_PRELOAD", "")
+    gomp_candidates = []
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        gomp_candidates.append(os.path.join(conda_prefix, "lib", "libgomp.so.1"))
+    gomp_candidates.append("/usr/lib/aarch64-linux-gnu/libgomp.so.1")
+    gldispatch_candidates = [
+        "/lib/aarch64-linux-gnu/libGLdispatch.so.0",
+        "/usr/lib/aarch64-linux-gnu/libGLdispatch.so.0",
+    ]
+
+    libs_to_preload = []
+    for candidate in gomp_candidates:
+        if candidate and os.path.exists(candidate):
+            libs_to_preload.append(candidate)
+            break
+    for candidate in gldispatch_candidates:
+        if candidate and os.path.exists(candidate):
+            libs_to_preload.append(candidate)
+            break
+
+    if all(candidate in preload.split() for candidate in libs_to_preload):
+        os.environ["GO2_LIBGOMP_PRELOAD_READY"] = "1"
+        return
+
+    if libs_to_preload:
+        env = os.environ.copy()
+        env["GO2_LIBGOMP_PRELOAD_READY"] = "1"
+        env["LD_PRELOAD"] = " ".join(libs_to_preload + ([preload] if preload else []))
+        os.execvpe(sys.executable, [sys.executable] + sys.argv, env)
+
+    os.environ["GO2_LIBGOMP_PRELOAD_READY"] = "1"
+
+
+_ensure_libgomp_preload()
+
+
 
 import rclpy 
 from rclpy.node import Node 
@@ -164,14 +212,7 @@ class ControllerROS2(Node):
 
         
         # Initialization of variables used in the main control loop --------------------------------
-        if config.policy_backend == "safe_rl":
-            from safe_rl_policy_wrapper import SafeRLPolicyWrapper
-
-            self.locomotion_policy = SafeRLPolicyWrapper(env=self.env)
-            self.get_logger().warn(
-                f"Using safe_rl training gains: {self.locomotion_policy.training_gain_summary}"
-            )
-        elif config.policy_backend == "go2_posture":
+        if config.policy_backend == "go2_posture":
             self.locomotion_policy = Go2PosturePolicyWrapper(
                 env=self.env,
                 run_dir=config.go2_posture_run_dir,
@@ -584,7 +625,7 @@ class ControllerROS2(Node):
         joints_vel.FR = qvel[env.legs_qvel_idx.FR]
         joints_vel.RL = qvel[env.legs_qvel_idx.RL]
         joints_vel.RR = qvel[env.legs_qvel_idx.RR]
-        if config.policy_backend in ("safe_rl", "go2_posture"):
+        if config.policy_backend == "go2_posture":
             ref_base_lin_vel, ref_base_ang_vel = env.target_base_vel(frame='base')
         else:
             ref_base_lin_vel, ref_base_ang_vel = env.target_base_vel()

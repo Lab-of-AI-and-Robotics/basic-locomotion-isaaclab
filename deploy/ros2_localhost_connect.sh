@@ -8,6 +8,8 @@ fi
 export ROS_LOCALHOST_ONLY=1
 unset ROS_DISCOVERY_SERVER
 unset ROS_SUPER_CLIENT
+unset RMW_IMPLEMENTATION
+unset CYCLONEDDS_URI
 ros2 daemon stop &&
 ros2 daemon start
 echo "ROS2 configured to use localhost only."

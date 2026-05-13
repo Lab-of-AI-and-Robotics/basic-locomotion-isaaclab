@@ -7,18 +7,14 @@ sys.path.append(dir_path+"/../scripts/rsl_rl")
 robot = os.environ.get("ROBOT", "go2")  # 'aliengo', 'go2', 'b2', 'hyqreal2'
 scene = os.environ.get("SCENE", "flat")  # flat, random_boxes, random_pyramids, perlin
 
-policy_backend = os.environ.get("POLICY_BACKEND", "go2_posture")  # "basic", "safe_rl", or "go2_posture"
-safe_rl_payload_path = os.environ.get(
-    "SAFE_RL_PAYLOAD",
-    os.path.abspath(os.path.join(dir_path, "..", "safe_rl_basic_locomotion_handoff", "payload")),
-)
+policy_backend = os.environ.get("POLICY_BACKEND", "go2_posture")  # "basic" or "go2_posture"
 go2_posture_policy_root = os.environ.get(
     "GO2_POSTURE_POLICY_ROOT",
     os.path.abspath(os.path.join(dir_path, "..", "tested_policies", "go2", "go2_posture_guidance")),
 )
 go2_posture_run_name = os.environ.get(
     "GO2_POSTURE_RUN_NAME",
-    "2026-05-04_23-04-13_postureON_clampON_air0.0",
+    "2026-05-05_06-17-00_postureON_clampOFF_air0.0",
 )
 go2_posture_run_dir = os.environ.get(
     "GO2_POSTURE_RUN_DIR",
@@ -30,33 +26,6 @@ go2_posture_checkpoint = os.environ.get(
 )
 go2_posture_device = os.environ.get("GO2_POSTURE_DEVICE", "cpu")
 go2_posture_env_cfg = None
-
-# Pick one safe_rl policy here. It can still be overridden from the terminal with
-# SAFE_RL_POLICY_NAME=<name>.
-safe_rl_available_policies = [
-    "transfer_flat_l1_debug",
-    "baseheight_020_support_nf",
-    "baseheight_015_support_nf",
-    "joint_rom_stand_fl_pct050",
-    "joint_rom_stand_fl_pct020",
-    "joint_rom_stand_fl_pct010",
-    "joint_rom_stand_fl_pct000",
-    "joint_rom_shiftx020_fl_pct050",
-    "joint_rom_shiftx020_fl_pct020",
-    "joint_rom_shiftx020_fl_pct010",
-    "joint_rom_shiftx020_fl_pct000",
-]
-safe_rl_selected_policy = "joint_rom_stand_fl_pct050"
-safe_rl_policy_name = os.environ.get("SAFE_RL_POLICY_NAME", safe_rl_selected_policy)
-if safe_rl_policy_name not in safe_rl_available_policies:
-    raise ValueError(
-        f"Unknown safe_rl policy: {safe_rl_policy_name!r}. "
-        f"Choose one of: {', '.join(safe_rl_available_policies)}"
-    )
-safe_rl_device = os.environ.get("SAFE_RL_DEVICE", "cpu")
-safe_rl_zero_action_tolerance = 0.35
-safe_rl_debug_steps = int(os.environ.get("SAFE_RL_DEBUG_STEPS", "10"))
-safe_rl_env_cfg = None
 
 # ----------------------------------------------------------------------------------------------------------------
 if(robot == "aliengo"):
@@ -99,13 +68,11 @@ rma_network = policy_folder_path + "/exported/rma.pth"
 
 # Load specific training parameters
 import yaml 
-with open(policy_folder_path + "/params/env.yaml", "r") as file:
-    training_env = yaml.unsafe_load(file)
-
-safe_rl_env_cfg_path = os.path.join(safe_rl_payload_path, "policies", safe_rl_policy_name, "params", "env.yaml")
-if os.path.isfile(safe_rl_env_cfg_path):
-    with open(safe_rl_env_cfg_path, "r") as file:
-        safe_rl_env_cfg = yaml.unsafe_load(file)
+training_env = {}
+training_env_path = policy_folder_path + "/params/env.yaml"
+if os.path.isfile(training_env_path):
+    with open(training_env_path, "r") as file:
+        training_env = yaml.unsafe_load(file)
 
 go2_posture_env_cfg_path = os.path.join(go2_posture_run_dir, "params", "env.yaml")
 if os.path.isfile(go2_posture_env_cfg_path):
@@ -115,6 +82,4 @@ if os.path.isfile(go2_posture_env_cfg_path):
 def active_training_env():
     if policy_backend == "go2_posture" and go2_posture_env_cfg is not None:
         return go2_posture_env_cfg
-    if policy_backend == "safe_rl" and safe_rl_env_cfg is not None:
-        return safe_rl_env_cfg
     return training_env
