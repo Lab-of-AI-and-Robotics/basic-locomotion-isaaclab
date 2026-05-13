@@ -67,8 +67,7 @@ class ControllerROS2(Node):
         self.declare_parameter("base_state_freshness_sec", 0.1)
         self.declare_parameter("base_lin_vel_clip", 2.0)
         self.declare_parameter("base_lin_vel_lpf_tau", 0.05)
-        self.declare_parameter("safe_rl_hold_zero_when_command_zero", True)
-        self.declare_parameter("safe_rl_command_zero_threshold", 0.03)
+        self.declare_parameter("command_zero_threshold", 0.03)
         self.declare_parameter("joystick_timeout_sec", 1.0)
         self.declare_parameter("go2_posture_hold_initial_when_command_zero", True)
         self.declare_parameter("go2_posture_hold_initial_on_joy_timeout", True)
@@ -90,11 +89,8 @@ class ControllerROS2(Node):
         self.base_state_freshness_sec = max(0.01, float(self.get_parameter("base_state_freshness_sec").value))
         self.base_lin_vel_clip = max(0.1, float(self.get_parameter("base_lin_vel_clip").value))
         self.base_lin_vel_lpf_tau = max(0.0, float(self.get_parameter("base_lin_vel_lpf_tau").value))
-        self.safe_rl_hold_zero_when_command_zero = bool(
-            self.get_parameter("safe_rl_hold_zero_when_command_zero").value
-        )
-        self.safe_rl_command_zero_threshold = max(
-            0.0, float(self.get_parameter("safe_rl_command_zero_threshold").value)
+        self.command_zero_threshold = max(
+            0.0, float(self.get_parameter("command_zero_threshold").value)
         )
         self.joystick_timeout_sec = max(0.0, float(self.get_parameter("joystick_timeout_sec").value))
         self.go2_posture_hold_initial_when_command_zero = bool(
@@ -205,14 +201,7 @@ class ControllerROS2(Node):
 
         
         # Initialization of variables used in the main control loop --------------------------------
-        if config.policy_backend == "safe_rl":
-            from safe_rl_policy_wrapper import SafeRLPolicyWrapper
-
-            self.locomotion_policy = SafeRLPolicyWrapper(env=self.env)
-            self.get_logger().warn(
-                f"Using safe_rl training gains: {self.locomotion_policy.training_gain_summary}"
-            )
-        elif config.policy_backend == "go2_posture":
+        if config.policy_backend == "go2_posture":
             self.locomotion_policy = Go2PosturePolicyWrapper(
                 env=self.env,
                 run_dir=config.go2_posture_run_dir,
@@ -656,13 +645,10 @@ class ControllerROS2(Node):
         joints_vel.FR = qvel[env.legs_qvel_idx.FR]
         joints_vel.RL = qvel[env.legs_qvel_idx.RL]
         joints_vel.RR = qvel[env.legs_qvel_idx.RR]
-        if config.policy_backend in ("safe_rl", "go2_posture"):
+        if config.policy_backend == "go2_posture":
             ref_base_lin_vel, ref_base_ang_vel = env.target_base_vel(frame='base')
         else:
             ref_base_lin_vel, ref_base_ang_vel = env.target_base_vel()
-
-        if config.policy_backend == "safe_rl":
-            self._update_safe_rl_zero_command_hold(locomotion_policy, ref_base_lin_vel, ref_base_ang_vel)
 
         go2_posture_hold_initial = self._go2_posture_should_hold_initial(ref_base_lin_vel, ref_base_ang_vel)
         if(self.console.isRLActivated):
@@ -760,25 +746,6 @@ class ControllerROS2(Node):
         legs.RR = joints[9:12]
         return legs
 
-    def _update_safe_rl_zero_command_hold(self, locomotion_policy, ref_base_lin_vel, ref_base_ang_vel):
-        if not hasattr(locomotion_policy, "hold_zero_action"):
-            return
-        static_hold = bool(getattr(locomotion_policy, "static_hold_zero_action", False))
-        command_norm = max(
-            abs(float(ref_base_lin_vel[0])),
-            abs(float(ref_base_lin_vel[1])),
-            abs(float(ref_base_ang_vel[2])),
-        )
-        command_is_zero = command_norm < self.safe_rl_command_zero_threshold
-        hold = static_hold or (self.safe_rl_hold_zero_when_command_zero and command_is_zero)
-        if hold != bool(locomotion_policy.hold_zero_action):
-            if hold:
-                self.get_logger().info("Safe RL holding zero latent action because joystick command is zero.")
-            else:
-                self.get_logger().info("Safe RL using actor action because joystick command is nonzero.")
-        locomotion_policy.hold_zero_action = hold
-
-
     def _go2_posture_should_hold_initial(self, ref_base_lin_vel, ref_base_ang_vel):
         if config.policy_backend != "go2_posture" or not self.console.isRLActivated:
             self.go2_posture_initial_hold_active = False
@@ -792,7 +759,7 @@ class ControllerROS2(Node):
             abs(float(ref_base_lin_vel[1])),
             abs(float(ref_base_ang_vel[2])),
         )
-        command_is_zero = command_norm < self.safe_rl_command_zero_threshold
+        command_is_zero = command_norm < self.command_zero_threshold
         hold = command_is_zero or (
             self.go2_posture_hold_initial_on_joy_timeout and self.joystick_timed_out
         )

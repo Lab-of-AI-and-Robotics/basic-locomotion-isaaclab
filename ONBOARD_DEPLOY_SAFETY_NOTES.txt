@@ -171,7 +171,7 @@ Safety mechanisms in run_controller_ros2.py
      go2_posture_hold_initial_on_joy_timeout
      go2_posture_hold_initial_use_stand_gains
      go2_posture_hold_max_joint_step
-     safe_rl_command_zero_threshold
+     command_zero_threshold
 
    If command is effectively zero, or joystick timed out, the controller does NOT run the
    policy action. It commands the policy default/initial joint pose instead.

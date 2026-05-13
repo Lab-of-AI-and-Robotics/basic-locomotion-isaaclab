@@ -22,7 +22,6 @@ from gym_quadruped.utils.mujoco.visual import render_sphere
 
 # Locomotion Policy imports
 from locomotion_policy_wrapper import LocomotionPolicyWrapper
-from safe_rl_policy_wrapper import SafeRLPolicyWrapper
 
 import config
 
@@ -172,20 +171,7 @@ if __name__ == '__main__':
     env.reset(random=False)
 
     # Initialization of variables used in the main control loop --------------------------------
-    if config.policy_backend == "safe_rl":
-        locomotion_policy = SafeRLPolicyWrapper(env=env)
-        print(f"[mujoco] using safe_rl training gains: {locomotion_policy.training_gain_summary}")
-        q0 = locomotion_policy.initial_joint_pos
-        env.mjData.qpos[2] = locomotion_policy.initial_base_height
-        env.mjData.qpos[env.legs_qpos_idx.FL] = q0[0:3]
-        env.mjData.qpos[env.legs_qpos_idx.FR] = q0[3:6]
-        env.mjData.qpos[env.legs_qpos_idx.RL] = q0[6:9]
-        env.mjData.qpos[env.legs_qpos_idx.RR] = q0[9:12]
-        env.mjData.qvel[:] = 0.0
-        locomotion_policy.apply_mujoco_actuator_dynamics(env)
-        locomotion_policy.apply_mujoco_joint_limits(env)
-        mujoco.mj_forward(env.mjModel, env.mjData)
-    elif config.policy_backend == "basic":
+    if config.policy_backend == "basic":
         locomotion_policy = LocomotionPolicyWrapper(env=env)
     else:
         raise ValueError(f"Unsupported policy_backend={config.policy_backend}")
@@ -194,14 +180,6 @@ if __name__ == '__main__':
     max_steps = int(os.environ.get("MUJOCO_MAX_STEPS", "0"))
     cmd_ramp_time = max(0.0, float(os.environ.get("MUJOCO_CMD_RAMP_TIME", "0.0")))
     cmd_yaw_sign = float(os.environ.get("MUJOCO_YAW_SIGN", "-1.0"))
-    safe_rl_command_frame = os.environ.get("SAFE_RL_MUJOCO_COMMAND_FRAME", "base").strip().lower()
-    if safe_rl_command_frame not in {"base", "heading"}:
-        raise ValueError("SAFE_RL_MUJOCO_COMMAND_FRAME must be 'base' or 'heading'")
-    safe_rl_concurrent_estimator = (
-        config.policy_backend == "safe_rl"
-        and str(os.environ.get("SAFE_RL_USE_CONCURRENT_ESTIMATOR", "0")).strip().lower()
-        in {"1", "true", "yes", "on"}
-    )
     if not headless:
         install_keyboard_command_callback(env)
         env.render()  # Pass in the first render call any mujoco.viewer.KeyCallbackType
@@ -237,7 +215,6 @@ if __name__ == '__main__':
         if(
             active_env_cfg.get("use_imu", False)
             or active_env_cfg.get("use_concurrent_state_est", False)
-            or safe_rl_concurrent_estimator
         ):
             sensordata = np.asarray(env.mjData.sensordata, dtype=np.float32)
             imu_linear_acceleration = sensordata[0:3] if sensordata.size >= 3 else np.zeros(3)
@@ -269,16 +246,7 @@ if __name__ == '__main__':
             env._ref_base_lin_vel_H[1] = cmd_scale * float(os.environ["MUJOCO_CMD_Y"])
         if "MUJOCO_CMD_YAW" in os.environ and not keyboard_command_active:
             env._ref_base_ang_yaw_dot = cmd_yaw_sign * cmd_scale * float(os.environ["MUJOCO_CMD_YAW"])
-        if config.policy_backend == "safe_rl" and safe_rl_command_frame == "heading":
-            ref_base_lin_vel = np.array(
-                [env._ref_base_lin_vel_H[0], env._ref_base_lin_vel_H[1], 0.0],
-                dtype=np.float32,
-            )
-            ref_base_ang_vel = np.array([0.0, 0.0, env._ref_base_ang_yaw_dot], dtype=np.float32)
-        elif config.policy_backend == "safe_rl":
-            ref_base_lin_vel, ref_base_ang_vel = env.target_base_vel(frame='base')
-        else:
-            ref_base_lin_vel, ref_base_ang_vel = env.target_base_vel()
+        ref_base_lin_vel, ref_base_ang_vel = env.target_base_vel()
 
         if(locomotion_policy.use_vision):
             offset_world_frame = heightmap_offset["pos"] @ heading_orientation_SO3.T
