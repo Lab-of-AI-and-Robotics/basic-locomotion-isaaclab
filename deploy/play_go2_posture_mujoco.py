@@ -7,7 +7,7 @@ import numpy as np
 import gym_quadruped.quadruped_env as quadruped_env_module
 from gym_quadruped.quadruped_env import QuadrupedEnv
 from gym_quadruped.utils.quadruped_utils import LegsAttr
-from gym_quadruped.utils.mujoco.terrain import add_perlin_heightfield
+from gym_quadruped.utils.mujoco.terrain import add_perlin_heightfield, add_world_of_pyramid
 
 from go2_posture_policy_wrapper import Go2PosturePolicyWrapper
 
@@ -30,6 +30,31 @@ KEY_W = 87
 
 
 def install_mild_perlin_scene(scene_name):
+    if scene_name == "random_pyramids":
+        max_height = float(os.environ.get("MUJOCO_PYRAMID_MAX_HEIGHT", "0.18"))
+        width = float(os.environ.get("MUJOCO_PYRAMID_WIDTH", "2.8"))
+        length = float(os.environ.get("MUJOCO_PYRAMID_LENGTH", "2.8"))
+        stair_nums = int(os.environ.get("MUJOCO_PYRAMID_STAIRS", "4"))
+
+        def generate_pyramid_terrain(base_scene_env_path, procedural_assets_path, hip_height, terrain_name="random_pyramids", seed=10):
+            del hip_height, terrain_name, seed
+            flat_scene_path = procedural_assets_path / "scene_flat.xml"
+            return add_world_of_pyramid(
+                flat_scene_path,
+                init_pos=[3.0, 0.0, 0.02],
+                width=width,
+                max_height=max_height,
+                length=length,
+                stair_nums=stair_nums,
+            )
+
+        quadruped_env_module.generate_terrain = generate_pyramid_terrain
+        print(
+            "[mujoco] random_pyramids terrain "
+            f"max_height={max_height:.3f}m width={width:.1f}m length={length:.1f}m stairs={stair_nums}"
+        )
+        return
+
     if scene_name not in {"mild_perlin", "rough_mild"}:
         return
 
