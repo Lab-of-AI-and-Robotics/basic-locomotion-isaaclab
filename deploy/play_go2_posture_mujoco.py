@@ -4,8 +4,10 @@ import time
 import mujoco
 import numpy as np
 
+import gym_quadruped.quadruped_env as quadruped_env_module
 from gym_quadruped.quadruped_env import QuadrupedEnv
 from gym_quadruped.utils.quadruped_utils import LegsAttr
+from gym_quadruped.utils.mujoco.terrain import add_perlin_heightfield
 
 from go2_posture_policy_wrapper import Go2PosturePolicyWrapper
 
@@ -25,6 +27,41 @@ KEY_Q = 81
 KEY_R = 82
 KEY_S = 83
 KEY_W = 87
+
+
+def install_mild_perlin_scene(scene_name):
+    if scene_name not in {"mild_perlin", "rough_mild"}:
+        return
+
+    max_height = float(os.environ.get("MUJOCO_TERRAIN_MAX_HEIGHT", "0.08"))
+    min_height = float(os.environ.get("MUJOCO_TERRAIN_MIN_HEIGHT", "0.005"))
+    size = float(os.environ.get("MUJOCO_TERRAIN_SIZE", "14.0"))
+    smooth = float(os.environ.get("MUJOCO_TERRAIN_SMOOTH", "90.0"))
+    octaves = int(os.environ.get("MUJOCO_TERRAIN_OCTAVES", "3"))
+    lacunarity = float(os.environ.get("MUJOCO_TERRAIN_LACUNARITY", "2.0"))
+
+    def generate_mild_terrain(base_scene_env_path, procedural_assets_path, hip_height, terrain_name="mild_perlin", seed=10):
+        del hip_height, terrain_name, seed
+        flat_scene_path = procedural_assets_path / "scene_flat.xml"
+        return add_perlin_heightfield(
+            flat_scene_path,
+            size=(size, size),
+            max_height=max_height,
+            min_height=min_height,
+            image_width=128,
+            img_height=128,
+            smooth=smooth,
+            perlin_octaves=octaves,
+            perlin_lacunarity=lacunarity,
+            output_hfield_image="height_field_mild.png",
+        )
+
+    quadruped_env_module.generate_terrain = generate_mild_terrain
+    print(
+        "[mujoco] mild_perlin terrain "
+        f"max_height={max_height:.3f}m size={size:.1f}m smooth={smooth:.1f} "
+        f"octaves={octaves} lacunarity={lacunarity:.1f}"
+    )
 
 
 def install_keyboard_command_callback(env):
@@ -121,6 +158,7 @@ if __name__ == "__main__":
 
     # Go2 posture was trained with dt=0.005 and decimation=4.
     simulation_dt = float(os.environ.get("MUJOCO_SIM_DT", "0.005"))
+    install_mild_perlin_scene(scene_name)
     env = QuadrupedEnv(
         robot="go2",
         scene=scene_name,
