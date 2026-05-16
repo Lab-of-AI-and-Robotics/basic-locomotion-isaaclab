@@ -179,6 +179,55 @@ def _load_adaptation_network(path, device):
     return network
 
 
+class _ConcurrentExplicitEstimator(nn.Module):
+    def __init__(self, checkpoint):
+        super().__init__()
+        state_dict = checkpoint["model_state_dict"]
+        layer_ids = sorted(
+            {
+                int(key.removeprefix("trunk.").split(".")[0])
+                for key in state_dict
+                if key.startswith("trunk.") and key.endswith(".weight")
+            }
+        )
+        if not layer_ids:
+            raise ValueError("Cannot find concurrent explicit estimator trunk weights")
+
+        modules = []
+        for layer_id in layer_ids:
+            weight = state_dict[f"trunk.{layer_id}.weight"]
+            modules.append(nn.Linear(weight.shape[1], weight.shape[0]))
+            modules.append(nn.ELU())
+        self.trunk = nn.Sequential(*modules)
+
+        last_dim = int(state_dict[f"trunk.{layer_ids[-1]}.weight"].shape[0])
+        self.velocity_head = nn.Linear(last_dim, 3)
+        self.contact_head = nn.Linear(last_dim, 4)
+        self.foot_height_head = nn.Linear(last_dim, 4)
+        self.load_state_dict(state_dict)
+        self.input_dim = int(checkpoint.get("input_dim", state_dict[f"trunk.{layer_ids[0]}.weight"].shape[1]))
+        self.output_dim = int(checkpoint.get("output_dim", 11))
+
+    def forward(self, inputs):
+        features = self.trunk(inputs)
+        return torch.cat(
+            [
+                self.velocity_head(features),
+                self.contact_head(features),
+                self.foot_height_head(features),
+            ],
+            dim=-1,
+        )
+
+
+def _load_concurrent_explicit_estimator(path, device):
+    checkpoint = torch.load(path, map_location=device)
+    network = _ConcurrentExplicitEstimator(checkpoint).to(device)
+    network.eval()
+    network.requires_grad_(False)
+    return network
+
+
 class Go2PosturePolicyWrapper:
     """MuJoCo-side wrapper for a go2_posture IsaacLab policy.
 
@@ -203,6 +252,10 @@ class Go2PosturePolicyWrapper:
         self.adaptation_obs_dim = int(self.cfg["adaptation_observation_dim"])
         self.use_rma = bool(self.cfg.get("use_rma", False))
         self.use_concurrent_state_estimator = bool(self.cfg.get("use_concurrent_state_estimator", False))
+        self.concurrent_state_estimator_mode = str(self.cfg.get("concurrent_state_estimator_mode", "velocity")).lower()
+        self.concurrent_policy_obs_mode = str(self.cfg.get("concurrent_policy_obs_mode", "current")).lower()
+        if self.concurrent_policy_obs_mode not in {"current", "history"}:
+            raise ValueError("concurrent_policy_obs_mode must be 'current' or 'history'")
         self.use_rlvrl_teacher_student = bool(self.cfg.get("use_rlvrl_teacher_student", False))
         self.RL_FREQ = 1.0 / (float(self.cfg["sim"]["dt"]) * float(self.cfg["decimation"]))
         self.joint_order = os.environ.get("GO2_POSTURE_JOINT_ORDER", "joint_grouped").strip().lower()
@@ -244,6 +297,13 @@ class Go2PosturePolicyWrapper:
 
         self.obs_history = np.zeros((self.history_length, self.base_obs_dim), dtype=np.float32)
         self.adaptation_history = np.zeros((self.history_length, self.adaptation_obs_dim), dtype=np.float32)
+        self.concurrent_estimator_single_obs_dim = int(self.cfg.get("concurrent_estimator_single_observation_dim", 45))
+        self.concurrent_estimator_history_length = int(self.cfg.get("concurrent_estimator_history_length", 1))
+        self.concurrent_explicit_state_dim = int(self.cfg.get("concurrent_explicit_estimator_output_dim", 11))
+        self.concurrent_estimator_history = np.zeros(
+            (self.concurrent_estimator_history_length, self.concurrent_estimator_single_obs_dim),
+            dtype=np.float32,
+        )
         self.last_action = np.zeros(12, dtype=np.float32)
         self.desired_joint_pos = _legs_attr_from_flat(self.default_joint_pos)
         self.policy_obs_dim = self.base_obs_dim * self.history_length + (11 if self.use_rma else 0)
@@ -262,13 +322,19 @@ class Go2PosturePolicyWrapper:
         else:
             self.use_exported_adaptation = bool(use_exported_adaptation)
         self.concurrent_state_estimator = None
+        self.concurrent_explicit_estimator = None
         self.rma_network = None
         if self.use_exported_adaptation:
             exported = self.run_dir / "exported"
             if self.use_concurrent_state_estimator:
-                self.concurrent_state_estimator = _load_adaptation_network(
-                    exported / "concurrent_state_estimator.pth", self.device
-                )
+                if self.concurrent_state_estimator_mode == "explicit":
+                    self.concurrent_explicit_estimator = _load_concurrent_explicit_estimator(
+                        exported / "concurrent_explicit_estimator.pth", self.device
+                    )
+                else:
+                    self.concurrent_state_estimator = _load_adaptation_network(
+                        exported / "concurrent_state_estimator.pth", self.device
+                    )
             if self.use_rma:
                 self.rma_network = _load_adaptation_network(exported / "rma.pth", self.device)
 
@@ -299,6 +365,7 @@ class Go2PosturePolicyWrapper:
             f"RL_FREQ={self.RL_FREQ:.1f}Hz Kp={self.Kp_walking:.2f} Kd={self.Kd_walking:.2f} "
             f"joint_order={self.joint_order} rlvrl={self.use_rlvrl_teacher_student}"
             f" rlvrl_actor_obs={self.rlvrl_actor_obs_mode}"
+            f" concurrent_mode={self.concurrent_state_estimator_mode}"
         )
         if not self.use_exported_adaptation:
             print("[go2_posture] MuJoCo oracle adaptation is enabled for sim-to-sim.")
@@ -337,7 +404,39 @@ class Go2PosturePolicyWrapper:
         ).astype(np.float32)
         adaptation_obs_flat = self._append_adaptation_history(adaptation_obs)
 
-        if self.concurrent_state_estimator is not None:
+        if self.concurrent_state_estimator_mode == "explicit":
+            estimator_obs = np.concatenate(
+                [
+                    base_ang_vel,
+                    self._get_projected_gravity(base_quat_wxyz),
+                    command,
+                    joint_pos - self.default_joint_pos_policy,
+                    joint_vel,
+                    self.last_action,
+                ]
+            ).astype(np.float32)
+            if estimator_obs.shape[0] != self.concurrent_estimator_single_obs_dim:
+                raise ValueError(
+                    "concurrent explicit estimator obs dim mismatch: "
+                    f"got={estimator_obs.shape[0]} expected={self.concurrent_estimator_single_obs_dim}"
+                )
+            estimator_obs_flat = self._append_concurrent_estimator_history(estimator_obs)
+            if self.concurrent_explicit_estimator is not None:
+                with torch.no_grad():
+                    raw_explicit_state = (
+                        self.concurrent_explicit_estimator(
+                            torch.tensor(estimator_obs_flat, dtype=torch.float32, device=self.device).view(1, -1)
+                        )
+                        .squeeze(0)
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+                explicit_state_obs = self._process_concurrent_explicit_output(raw_explicit_state)
+            else:
+                explicit_state_obs = self._oracle_concurrent_explicit_state(base_lin_vel, feet_contacts)
+            root_lin_vel_obs = explicit_state_obs[:3]
+        elif self.concurrent_state_estimator is not None:
             with torch.no_grad():
                 root_lin_vel_obs = (
                     self.concurrent_state_estimator(
@@ -348,24 +447,36 @@ class Go2PosturePolicyWrapper:
                     .cpu()
                     .numpy()
                 )
+            explicit_state_obs = None
+            estimator_obs = None
+            estimator_obs_flat = None
         else:
             root_lin_vel_obs = base_lin_vel
+            explicit_state_obs = None
+            estimator_obs = None
+            estimator_obs_flat = None
 
         self._update_guide(command, root_lin_vel_obs[0], velocity_b=root_lin_vel_obs, omega_b=base_ang_vel)
         guide_obs = np.array([self.guide_roll, self.guide_pitch, self.guide_height], dtype=np.float32)
 
-        obs_step = np.concatenate(
-            [
-                root_lin_vel_obs.astype(np.float32),
-                base_ang_vel,
-                self._get_projected_gravity(base_quat_wxyz),
-                command,
-                joint_pos - self.default_joint_pos_policy,
-                joint_vel,
-                self.last_action,
-                guide_obs,
-            ]
-        ).astype(np.float32)
+        if self.concurrent_state_estimator_mode == "explicit":
+            actor_base_obs = estimator_obs_flat if self.concurrent_policy_obs_mode == "history" else estimator_obs
+            obs_step = np.concatenate([actor_base_obs, explicit_state_obs, guide_obs]).astype(np.float32)
+        else:
+            obs_step = np.concatenate(
+                [
+                    root_lin_vel_obs.astype(np.float32),
+                    base_ang_vel,
+                    self._get_projected_gravity(base_quat_wxyz),
+                    command,
+                    joint_pos - self.default_joint_pos_policy,
+                    joint_vel,
+                    self.last_action,
+                    guide_obs,
+                ]
+            ).astype(np.float32)
+        if obs_step.shape[0] != self.base_obs_dim:
+            raise ValueError(f"go2_posture obs_step dim mismatch: got={obs_step.shape[0]} expected={self.base_obs_dim}")
         obs = self._append_obs_history(obs_step)
 
         if self.use_rma:
@@ -410,6 +521,35 @@ class Go2PosturePolicyWrapper:
         self.adaptation_history[:-1] = self.adaptation_history[1:]
         self.adaptation_history[-1] = obs_step
         return self.adaptation_history.reshape(-1).astype(np.float32)
+
+    def _append_concurrent_estimator_history(self, obs_step):
+        self.concurrent_estimator_history[:-1] = self.concurrent_estimator_history[1:]
+        self.concurrent_estimator_history[-1] = obs_step
+        return self.concurrent_estimator_history.reshape(-1).astype(np.float32)
+
+    def _process_concurrent_explicit_output(self, raw_state):
+        raw_state = np.asarray(raw_state, dtype=np.float32).reshape(self.concurrent_explicit_state_dim)
+        velocity = raw_state[:3].copy()
+        vx_min, vx_max = self.cfg.get("concurrent_velocity_clamp_x", (-4.0, 4.0))
+        vy_min, vy_max = self.cfg.get("concurrent_velocity_clamp_y", (-2.0, 2.0))
+        vz_min, vz_max = self.cfg.get("concurrent_velocity_clamp_z", (-1.0, 1.0))
+        velocity[0] = np.clip(velocity[0], float(vx_min), float(vx_max))
+        velocity[1] = np.clip(velocity[1], float(vy_min), float(vy_max))
+        velocity[2] = np.clip(velocity[2], float(vz_min), float(vz_max))
+        contacts = 1.0 / (1.0 + np.exp(-raw_state[3:7]))
+        foot_height = raw_state[7:11].copy()
+        fh_min, fh_max = self.cfg.get("concurrent_foot_height_clamp", (-0.2, 0.5))
+        foot_height = np.clip(foot_height, float(fh_min), float(fh_max))
+        return np.concatenate([velocity, contacts, foot_height]).astype(np.float32)
+
+    def _oracle_concurrent_explicit_state(self, base_lin_vel, feet_contacts):
+        velocity = np.asarray(base_lin_vel, dtype=np.float32).reshape(3)
+        if feet_contacts is None:
+            contacts = np.zeros(4, dtype=np.float32)
+        else:
+            contacts = np.asarray(feet_contacts, dtype=np.float32).reshape(4)
+        foot_height = np.zeros(4, dtype=np.float32)
+        return np.concatenate([velocity, contacts, foot_height]).astype(np.float32)
 
     def _update_guide(self, command, current_vx, velocity_b=None, omega_b=None):
         ctrl_dt = 1.0 / self.RL_FREQ
