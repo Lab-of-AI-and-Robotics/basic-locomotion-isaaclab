@@ -183,6 +183,9 @@ class _ConcurrentExplicitEstimator(nn.Module):
     def __init__(self, checkpoint):
         super().__init__()
         state_dict = checkpoint["model_state_dict"]
+        self.output_dim = int(checkpoint.get("output_dim", 12 if "base_height_head.weight" in state_dict else 11))
+        if self.output_dim not in (11, 12):
+            raise ValueError("Concurrent explicit estimator output_dim must be 11 or 12.")
         layer_ids = sorted(
             {
                 int(key.removeprefix("trunk.").split(".")[0])
@@ -204,20 +207,20 @@ class _ConcurrentExplicitEstimator(nn.Module):
         self.velocity_head = nn.Linear(last_dim, 3)
         self.contact_head = nn.Linear(last_dim, 4)
         self.foot_height_head = nn.Linear(last_dim, 4)
+        self.base_height_head = nn.Linear(last_dim, 1) if self.output_dim == 12 else None
         self.load_state_dict(state_dict)
         self.input_dim = int(checkpoint.get("input_dim", state_dict[f"trunk.{layer_ids[0]}.weight"].shape[1]))
-        self.output_dim = int(checkpoint.get("output_dim", 11))
 
     def forward(self, inputs):
         features = self.trunk(inputs)
-        return torch.cat(
-            [
-                self.velocity_head(features),
-                self.contact_head(features),
-                self.foot_height_head(features),
-            ],
-            dim=-1,
-        )
+        outputs = [
+            self.velocity_head(features),
+            self.contact_head(features),
+            self.foot_height_head(features),
+        ]
+        if self.base_height_head is not None:
+            outputs.append(self.base_height_head(features))
+        return torch.cat(outputs, dim=-1)
 
 
 def _load_concurrent_explicit_estimator(path, device):
@@ -237,6 +240,7 @@ class Go2PosturePolicyWrapper:
     """
 
     def __init__(self, env, run_dir=None, checkpoint=None, device=None, use_exported_adaptation=None):
+        self.env = env
         self.run_dir = Path(run_dir or os.environ.get("GO2_POSTURE_RUN_DIR", DEFAULT_RUN_DIR)).expanduser()
         self.checkpoint_path = Path(
             checkpoint or os.environ.get("GO2_POSTURE_CHECKPOINT", self.run_dir / "model_9999.pt")
@@ -304,9 +308,18 @@ class Go2PosturePolicyWrapper:
             (self.concurrent_estimator_history_length, self.concurrent_estimator_single_obs_dim),
             dtype=np.float32,
         )
+        self.cse_previous_joint_target_policy = self.default_joint_pos_policy.copy()
+        self.cse_llast_joint_target_policy = self.default_joint_pos_policy.copy()
+        self.cse_joint_pos_err_history = np.zeros((3, 12), dtype=np.float32)
+        self.cse_joint_vel_history = np.zeros((3, 12), dtype=np.float32)
         self.last_action = np.zeros(12, dtype=np.float32)
         self.desired_joint_pos = _legs_attr_from_flat(self.default_joint_pos)
-        self.policy_obs_dim = self.base_obs_dim * self.history_length + (11 if self.use_rma else 0)
+        if self.concurrent_state_estimator_mode == "explicit":
+            self.policy_obs_dim = self.base_obs_dim
+        else:
+            self.policy_obs_dim = self.base_obs_dim * self.history_length
+        if self.use_rma:
+            self.policy_obs_dim += int(self.cfg.get("rma_output_dim", 11))
         self.rlvrl_actor_obs_mode = None
 
         self.prev_vx = 0.0
@@ -405,16 +418,13 @@ class Go2PosturePolicyWrapper:
         adaptation_obs_flat = self._append_adaptation_history(adaptation_obs)
 
         if self.concurrent_state_estimator_mode == "explicit":
-            estimator_obs = np.concatenate(
-                [
-                    base_ang_vel,
-                    self._get_projected_gravity(base_quat_wxyz),
-                    command,
-                    joint_pos - self.default_joint_pos_policy,
-                    joint_vel,
-                    self.last_action,
-                ]
-            ).astype(np.float32)
+            estimator_obs = self._build_concurrent_estimator_observation(
+                base_quat_wxyz=base_quat_wxyz,
+                base_ang_vel=base_ang_vel,
+                command=command,
+                joint_pos=joint_pos,
+                joint_vel=joint_vel,
+            )
             if estimator_obs.shape[0] != self.concurrent_estimator_single_obs_dim:
                 raise ValueError(
                     "concurrent explicit estimator obs dim mismatch: "
@@ -434,7 +444,7 @@ class Go2PosturePolicyWrapper:
                     )
                 explicit_state_obs = self._process_concurrent_explicit_output(raw_explicit_state)
             else:
-                explicit_state_obs = self._oracle_concurrent_explicit_state(base_lin_vel, feet_contacts)
+                explicit_state_obs = self._oracle_concurrent_explicit_state(base_lin_vel, feet_contacts, base_pos)
             root_lin_vel_obs = explicit_state_obs[:3]
         elif self.concurrent_state_estimator is not None:
             with torch.no_grad():
@@ -477,7 +487,8 @@ class Go2PosturePolicyWrapper:
             ).astype(np.float32)
         if obs_step.shape[0] != self.base_obs_dim:
             raise ValueError(f"go2_posture obs_step dim mismatch: got={obs_step.shape[0]} expected={self.base_obs_dim}")
-        obs = self._append_obs_history(obs_step)
+        obs_history_flat = self._append_obs_history(obs_step)
+        obs = obs_step.copy() if self.concurrent_state_estimator_mode == "explicit" else obs_history_flat
 
         if self.use_rma:
             if self.rma_network is not None:
@@ -508,9 +519,55 @@ class Go2PosturePolicyWrapper:
 
         self.last_action = action.copy()
         joint_target_policy = self.guide_action_policy + self.action_scale * action
+        self.cse_llast_joint_target_policy = self.cse_previous_joint_target_policy.copy()
+        self.cse_previous_joint_target_policy = joint_target_policy.copy()
         joint_target = self._to_leg_grouped(joint_target_policy)
         self.desired_joint_pos = _legs_attr_from_flat(joint_target)
         return self.desired_joint_pos
+
+    def _build_concurrent_estimator_observation(self, base_quat_wxyz, base_ang_vel, command, joint_pos, joint_vel):
+        projected_gravity = self._get_projected_gravity(base_quat_wxyz)
+        joint_pos_err = joint_pos - self.default_joint_pos_policy
+        if self.concurrent_estimator_single_obs_dim == 45:
+            return np.concatenate(
+                [
+                    base_ang_vel,
+                    projected_gravity,
+                    command,
+                    joint_pos_err,
+                    joint_vel,
+                    self.last_action,
+                ]
+            ).astype(np.float32)
+
+        previous_joint_target_err = self.cse_previous_joint_target_policy - self.default_joint_pos_policy
+        llast_joint_target_err = self.cse_llast_joint_target_policy - self.default_joint_pos_policy
+        foot_pos_b = self._get_foot_positions_body_frame_policy_order()
+        obs = np.concatenate(
+            [
+                base_ang_vel,
+                projected_gravity,
+                command,
+                joint_pos_err,
+                joint_vel,
+                previous_joint_target_err,
+                llast_joint_target_err,
+                self.cse_joint_pos_err_history.reshape(-1),
+                self.cse_joint_vel_history.reshape(-1),
+                foot_pos_b,
+            ]
+        ).astype(np.float32)
+        self.cse_joint_pos_err_history[:-1] = self.cse_joint_pos_err_history[1:]
+        self.cse_joint_pos_err_history[-1] = joint_pos_err
+        self.cse_joint_vel_history[:-1] = self.cse_joint_vel_history[1:]
+        self.cse_joint_vel_history[-1] = joint_vel
+        return obs
+
+    def _get_foot_positions_body_frame_policy_order(self):
+        try:
+            return _flat_legs(self.env.feet_pos(frame="base"))
+        except Exception:
+            return np.zeros(12, dtype=np.float32)
 
     def _append_obs_history(self, obs_step):
         self.obs_history[:-1] = self.obs_history[1:]
@@ -536,20 +593,33 @@ class Go2PosturePolicyWrapper:
         velocity[0] = np.clip(velocity[0], float(vx_min), float(vx_max))
         velocity[1] = np.clip(velocity[1], float(vy_min), float(vy_max))
         velocity[2] = np.clip(velocity[2], float(vz_min), float(vz_max))
-        contacts = 1.0 / (1.0 + np.exp(-raw_state[3:7]))
+        contacts = 1.0 / (1.0 + np.exp(-np.clip(raw_state[3:7], -60.0, 60.0)))
         foot_height = raw_state[7:11].copy()
         fh_min, fh_max = self.cfg.get("concurrent_foot_height_clamp", (-0.2, 0.5))
         foot_height = np.clip(foot_height, float(fh_min), float(fh_max))
-        return np.concatenate([velocity, contacts, foot_height]).astype(np.float32)
+        state = [velocity, contacts, foot_height]
+        if raw_state.shape[0] >= 12:
+            bh_min, bh_max = self.cfg.get("concurrent_base_height_clamp", (0.12, 0.7))
+            base_height = np.array([np.clip(raw_state[11], float(bh_min), float(bh_max))], dtype=np.float32)
+            state.append(base_height)
+        return np.concatenate(state).astype(np.float32)
 
-    def _oracle_concurrent_explicit_state(self, base_lin_vel, feet_contacts):
+    def _oracle_concurrent_explicit_state(self, base_lin_vel, feet_contacts, base_pos=None):
         velocity = np.asarray(base_lin_vel, dtype=np.float32).reshape(3)
         if feet_contacts is None:
             contacts = np.zeros(4, dtype=np.float32)
         else:
             contacts = np.asarray(feet_contacts, dtype=np.float32).reshape(4)
         foot_height = np.zeros(4, dtype=np.float32)
-        return np.concatenate([velocity, contacts, foot_height]).astype(np.float32)
+        state = [velocity, contacts, foot_height]
+        if self.concurrent_explicit_state_dim >= 12:
+            if base_pos is None:
+                base_height_value = float(self.cfg.get("concurrent_explicit_base_height_init", self.guide_height))
+            else:
+                base_height_value = float(np.asarray(base_pos, dtype=np.float32).reshape(3)[2])
+            bh_min, bh_max = self.cfg.get("concurrent_base_height_clamp", (0.12, 0.7))
+            state.append(np.array([np.clip(base_height_value, float(bh_min), float(bh_max))], dtype=np.float32))
+        return np.concatenate(state).astype(np.float32)
 
     def _update_guide(self, command, current_vx, velocity_b=None, omega_b=None):
         ctrl_dt = 1.0 / self.RL_FREQ
