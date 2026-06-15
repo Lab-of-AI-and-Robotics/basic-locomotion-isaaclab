@@ -260,6 +260,9 @@ class Go2PosturePolicyWrapper:
         self.concurrent_policy_obs_mode = str(self.cfg.get("concurrent_policy_obs_mode", "current")).lower()
         if self.concurrent_policy_obs_mode not in {"current", "history"}:
             raise ValueError("concurrent_policy_obs_mode must be 'current' or 'history'")
+        self.posture_guide_arch_enabled = bool(self.cfg.get("posture_guide_arch_enabled", True))
+        self.posture_guide_observation_enabled = bool(self.cfg.get("posture_guide_observation_enabled", True))
+        self.posture_guide_target_enabled = bool(self.cfg.get("posture_guide_target_enabled", True))
         self.use_rlvrl_teacher_student = bool(self.cfg.get("use_rlvrl_teacher_student", False))
         self.RL_FREQ = 1.0 / (float(self.cfg["sim"]["dt"]) * float(self.cfg["decimation"]))
         self.joint_order = os.environ.get("GO2_POSTURE_JOINT_ORDER", "joint_grouped").strip().lower()
@@ -403,7 +406,7 @@ class Go2PosturePolicyWrapper:
         joint_pos = self._to_policy_order(joint_pos_leg_grouped)
         joint_vel = self._to_policy_order(joint_vel_leg_grouped)
 
-        prev_guide_obs = np.array([self.guide_roll, self.guide_pitch, self.guide_height], dtype=np.float32)
+        prev_guide_obs = self._get_guide_observation()
         adaptation_obs = np.concatenate(
             [
                 base_ang_vel,
@@ -467,7 +470,7 @@ class Go2PosturePolicyWrapper:
             estimator_obs_flat = None
 
         self._update_guide(command, root_lin_vel_obs[0], velocity_b=root_lin_vel_obs, omega_b=base_ang_vel)
-        guide_obs = np.array([self.guide_roll, self.guide_pitch, self.guide_height], dtype=np.float32)
+        guide_obs = self._get_guide_observation()
 
         if self.concurrent_state_estimator_mode == "explicit":
             actor_base_obs = estimator_obs_flat if self.concurrent_policy_obs_mode == "history" else estimator_obs
@@ -569,6 +572,13 @@ class Go2PosturePolicyWrapper:
         except Exception:
             return np.zeros(12, dtype=np.float32)
 
+    def _get_guide_observation(self):
+        if not self.posture_guide_arch_enabled:
+            return np.zeros(0, dtype=np.float32)
+        if self.posture_guide_observation_enabled:
+            return np.array([self.guide_roll, self.guide_pitch, self.guide_height], dtype=np.float32)
+        return np.array([0.0, 0.0, float(self.cfg["guide_h_nom"])], dtype=np.float32)
+
     def _append_obs_history(self, obs_step):
         self.obs_history[:-1] = self.obs_history[1:]
         self.obs_history[-1] = obs_step
@@ -653,6 +663,11 @@ class Go2PosturePolicyWrapper:
             roll_signed = float(np.clip(roll_signed, -float(self.cfg["guide_roll_max"]), float(self.cfg["guide_roll_max"])))
             pitch = float(np.clip(pitch, -float(self.cfg["guide_pitch_max"]), float(self.cfg["guide_pitch_max"])))
             height = float(np.clip(height, float(self.cfg["guide_h_min"]), float(self.cfg["guide_h_nom"])))
+
+        if not self.posture_guide_target_enabled:
+            roll_signed = 0.0
+            pitch = 0.0
+            height = float(self.cfg["guide_h_nom"])
 
         self.guide_roll = roll_signed
         self.guide_pitch = pitch
