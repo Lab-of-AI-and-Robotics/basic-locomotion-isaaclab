@@ -1,0 +1,354 @@
+GO2 ROLL-ONLY IK DEPLOYMENT GUIDE
+=================================
+
+Run snapshot
+------------
+Run name:
+  2026-07-17_13-30-52_2026-07-16_12-04-05_rollonly_k075_phi40_rlim1.5_bh10_dq005
+
+Committed checkpoint:
+  model_3350.pt
+
+Required files:
+  model_3350.pt
+  params/env.yaml
+  params/agent.yaml
+  exported/concurrent_explicit_estimator.pth
+
+This file describes the training-side guide and IK contract that must be
+reproduced during MuJoCo or real-robot inference.
+
+
+1. Control contract
+-------------------
+Simulation time step:
+  sim_dt = 0.005 s
+  decimation = 4
+  policy_dt = 0.020 s
+  policy_frequency = 50 Hz
+
+Policy output:
+  12-dimensional residual joint action
+
+Final joint-position target:
+
+  q_des_policy = q_guide_policy + 0.25 * policy_output
+
+IMPORTANT:
+  q_guide is already an absolute joint-position target produced by IK.
+  Do not add default_joint_pos again.
+
+Incorrect:
+  q_des = default_joint_pos + q_guide + 0.25 * policy_output
+
+Incorrect:
+  q_des = default_joint_pos + 0.25 * policy_output
+
+Correct:
+  q_des = q_guide_IK + 0.25 * policy_output
+
+PD parameters saved by training:
+  Kp = 25.0
+  Kd = 0.5
+  effort limit = 23.5 Nm
+
+
+2. Joint orders
+---------------
+The IK is solved in canonical leg-grouped order:
+
+  [
+    FL_hip, FL_thigh, FL_calf,
+    FR_hip, FR_thigh, FR_calf,
+    RL_hip, RL_thigh, RL_calf,
+    RR_hip, RR_thigh, RR_calf
+  ]
+
+The default canonical joint position is:
+
+  [
+     0.1, 0.8, -1.5,
+    -0.1, 0.8, -1.5,
+     0.1, 1.0, -1.5,
+    -0.1, 1.0, -1.5
+  ]
+
+The actor uses joint-grouped order:
+
+  [
+    FL_hip, FR_hip, RL_hip, RR_hip,
+    FL_thigh, FR_thigh, RL_thigh, RR_thigh,
+    FL_calf, FR_calf, RL_calf, RR_calf
+  ]
+
+Therefore:
+  1. Solve IK in canonical leg-grouped order.
+  2. Convert q_guide to joint-grouped order.
+  3. Add 0.25 * actor_output in joint-grouped order.
+  4. Convert the result back to the robot's motor order before commanding it.
+
+
+3. Roll-only guide used for this run
+------------------------------------
+Saved settings:
+  guide_k_roll = 0.75
+  guide_roll_max = 0.698132 rad (40 degrees)
+  guide_roll_rate_limit = 1.5 rad/s
+  guide_roll_rate_limit_enabled = true
+  guide_k_pitch = 0.0
+  height_guide_enabled = false
+  guide_h_nom = 0.34 m
+  lateral_shift_guide_enabled = false
+
+For this run:
+  guide_pitch = 0
+  guide_height = 0.34 m
+  guide_lateral_shift = 0
+
+The exact training-side roll target uses commands, not measured or estimated
+velocity:
+
+  a_lat = abs(vx_command) * abs(wz_command)
+  roll_magnitude = 0.75 * atan(a_lat / 9.81)
+
+  if wz_command > 0:
+      roll_raw = -roll_magnitude
+  else:
+      roll_raw = +roll_magnitude
+
+  if abs(vx_command) < 1e-6 or abs(wz_command) < 1e-6:
+      roll_raw = 0
+
+  roll_raw = clamp(roll_raw, -0.698132, +0.698132)
+
+Apply the rate limiter every 0.020 s policy step:
+
+  max_delta = 1.5 * 0.020 = 0.030 rad
+  delta = clamp(roll_raw - previous_guide_roll, -0.030, +0.030)
+  guide_roll = previous_guide_roll + delta
+
+Initialize previous_guide_roll to zero at reset.
+
+Reference values before rate limiting:
+  vx=+1.0, wz=+1.0 -> roll_raw=-0.076189 rad
+  vx=+1.0, wz=-1.0 -> roll_raw=+0.076189 rad
+  vx=+3.5, wz=+3.5 -> roll_raw=-0.671668 rad
+
+Coordinate/sign convention:
+  +X = forward
+  +Y = left
+  +Z = up
+  +wz = left turn
+  +wz produces a negative guide roll for inward lean in this codebase.
+
+
+4. Go2 kinematic constants
+--------------------------
+All values are in meters and come from the Go2 URDF geometry used in training.
+
+  front hip X              = +0.1934
+  rear hip X               = -0.1934
+  hip origin absolute Y    =  0.0465
+  hip-to-thigh Y offset    =  0.0955
+  thigh length             =  0.213
+  calf length              =  0.213
+
+Leg side signs in FL, FR, RL, RR order:
+
+  side = [+1, -1, +1, -1]
+
+Hip origins in the base frame:
+
+  FL = [+0.1934, +0.0465, 0]
+  FR = [+0.1934, -0.0465, 0]
+  RL = [-0.1934, +0.0465, 0]
+  RR = [-0.1934, -0.0465, 0]
+
+
+5. Nominal forward kinematics
+-----------------------------
+For each leg, with qh=hip, qt=thigh, qc=calf:
+
+  sagittal_x = -L1*sin(qt) - L2*sin(qt + qc)
+  sagittal_z = -L1*cos(qt) - L2*cos(qt + qc)
+  lateral_y  = side * 0.0955
+
+  rel_x = sagittal_x
+  rel_y = cos(qh)*lateral_y - sin(qh)*sagittal_z
+  rel_z = sin(qh)*lateral_y + cos(qh)*sagittal_z
+
+  nominal_foot_base = hip_origin + [rel_x, rel_y, rel_z]
+
+Use the default canonical joint position to calculate the four nominal foot
+positions. These feet are treated as fixed in the world while the desired base
+roll, pitch, and height are applied.
+
+
+6. Desired foot targets for the base posture
+--------------------------------------------
+Start with:
+
+  world_rel = nominal_foot_base
+
+General implementation:
+
+  world_rel.y -= lateral_shift
+  world_rel.z += h_nom - guide_height
+
+For this specific run both terms are zero because lateral_shift=0 and
+guide_height=h_nom=0.34.
+
+Let:
+  cp = cos(guide_pitch)
+  sp = sin(guide_pitch)
+  cr = cos(guide_roll)
+  sr = sin(guide_roll)
+
+The desired rotation is:
+
+  R_des = R_y(pitch) * R_x(roll)
+
+The fixed world foot point expressed in the desired base frame is
+R_des^T * world_rel:
+
+  x_p = cp*x_w - sp*z_w
+  y_p = y_w
+  z_p = sp*x_w + cp*z_w
+
+  target_x = x_p
+  target_y = cr*y_p + sr*z_p
+  target_z = -sr*y_p + cr*z_p
+
+
+7. Per-leg analytic inverse kinematics
+--------------------------------------
+Subtract the corresponding hip origin:
+
+  [x, y, z] = target_foot_base - hip_origin
+
+Let:
+  d = side * 0.0955
+  L1 = 0.213
+  L2 = 0.213
+  eps = 1e-8
+
+Compute the sagittal Z component:
+
+  sagittal_z = -sqrt(max(y*y + z*z - 0.0955*0.0955, eps))
+
+Hip angle:
+
+  q_hip = wrap_to_pi(atan2(z, y) - atan2(sagittal_z, d))
+
+Planar reach and knee:
+
+  reach_sq = max(x*x + sagittal_z*sagittal_z, eps)
+
+  cos_knee = (reach_sq - L1*L1 - L2*L2) / (2*L1*L2)
+  cos_knee = clamp(cos_knee, -0.999999, +0.999999)
+
+  q_calf = -acos(cos_knee)
+
+Thigh angle:
+
+  q_thigh = atan2(-x, -sagittal_z)
+             - atan2(L2*sin(q_calf), L1 + L2*cos(q_calf))
+
+Joint limits applied by the training IK:
+
+  q_hip  in [-1.0472, 1.0472]
+
+  front thigh in [-1.5708, 3.4907]
+  rear thigh  in [-0.5236, 4.5379]
+
+  q_calf in [-2.7227, -0.83776]
+
+Return [q_hip, q_thigh, q_calf] for FL, FR, RL, RR.
+
+
+8. Numerical IK checks
+----------------------
+These values are useful for verifying a new implementation. Values are in
+radians. Pitch=0, height=0.34, lateral_shift=0 for all checks.
+
+guide_roll = 0.0, leg-grouped result:
+
+  [ 0.1,  0.8, -1.5,
+   -0.1,  0.8, -1.5,
+    0.1,  1.0, -1.5,
+   -0.1,  1.0, -1.5 ]
+
+guide_roll = +0.2, leg-grouped result:
+
+  [-0.100000,  0.766046, -1.434984,
+   -0.306098,  0.830235, -1.557664,
+   -0.100000,  0.961290, -1.436905,
+   -0.306291,  1.034823, -1.555798]
+
+guide_roll = -0.2, leg-grouped result:
+
+  [ 0.306098,  0.830235, -1.557664,
+    0.100000,  0.766046, -1.434984,
+    0.306291,  1.034823, -1.555798,
+    0.100000,  0.961290, -1.436905]
+
+The roll=0 result must reproduce the default position within floating-point
+tolerance. If it does not, check joint order, hip side signs, and frame signs.
+
+
+9. Policy and estimator integration
+-----------------------------------
+This is a standard ActorCritic policy trained with PPO symmetry augmentation.
+It is not an RLvRL teacher/student policy and does not use an RMA latent.
+
+Actor network:
+  input 153
+  hidden [512, 256, 128], ELU
+  output 12
+
+Explicit concurrent estimator:
+  input 141
+  output 11 = body linear velocity 3 + foot contacts 4 + foot heights 4
+
+Actor observation for this run:
+  estimator deployable observation 141
+  + estimated explicit state 11
+  + guide roll 1
+  = 153
+
+The actor receives guide_roll as one observation dimension. It does not receive
+guide pitch or guide height for this run.
+
+
+10. Current wrapper parity warning
+----------------------------------
+At the time this guide was written, the IK equations in
+deploy/go2_posture_policy_wrapper.py match the training implementation.
+
+However, the wrapper's roll-guide generator must also be checked. Exact training
+parity requires both of the following:
+
+  1. Use abs(vx_command) * abs(wz_command) for a_lat.
+  2. Apply the 1.5 rad/s rate limit, which is 0.03 rad per 50 Hz step.
+
+A wrapper that instead uses norm(estimated_velocity_xy) * abs(measured_wz), or
+that applies no roll rate limiter, is not reproducing this checkpoint's training
+contract even if its IK solver is correct.
+
+
+11. Deployment checklist
+------------------------
+[ ] Load model_3350.pt and concurrent_explicit_estimator.pth.
+[ ] Run policy and estimator at 50 Hz.
+[ ] Use the saved joint ordering.
+[ ] Generate roll from command vx and command wz with the saved sign convention.
+[ ] Clamp roll to +/-0.698132 rad.
+[ ] Rate-limit roll by +/-0.03 rad per policy step.
+[ ] Set guide_pitch=0, guide_height=0.34, lateral_shift=0.
+[ ] Solve the four analytic leg IK problems above.
+[ ] Convert IK output to actor joint-grouped order.
+[ ] Compute q_des = q_guide_IK + 0.25 * policy_output.
+[ ] Convert q_des to the hardware motor order.
+[ ] Apply Kp=25.0, Kd=0.5 and the 23.5 Nm effort limit.
+[ ] Verify the numerical IK checks before enabling motor torque.
+
