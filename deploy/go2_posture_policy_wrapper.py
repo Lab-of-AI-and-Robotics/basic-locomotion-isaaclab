@@ -54,8 +54,181 @@ def _legs_attr_from_flat(q):
     return legs
 
 
+def _wrap_to_pi(angle):
+    return np.arctan2(np.sin(angle), np.cos(angle))
+
+
+def _infer_guide_obs_dim(cfg, base_obs_dim, adaptation_obs_dim):
+    if not bool(cfg.get("posture_guide_arch_enabled", True)):
+        return 0
+    explicit_dim = cfg.get("posture_guide_observation_dim")
+    if explicit_dim in (0, 1, 3):
+        return int(explicit_dim)
+
+    # Deployable obs: ang_vel(3) + projected_gravity(3) + command(3)
+    # + joint_pos_err(12) + joint_vel(12) + previous_action(12) = 45, plus guide.
+    guide_dim = int(adaptation_obs_dim) - 45
+    if guide_dim in (0, 1, 3):
+        return guide_dim
+
+    # Velocity/current obs: root_lin_vel(3) + deployable obs without guide = 48, plus guide.
+    guide_dim = int(base_obs_dim) - 48
+    if guide_dim in (0, 1, 3):
+        return guide_dim
+
+    return 3
+
+
+def _go2_forward_feet_in_base(
+    joint_pos,
+    hip_x_front=0.1934,
+    hip_x_rear=-0.1934,
+    hip_y=0.0465,
+    thigh_offset_y=0.0955,
+    thigh_length=0.213,
+    calf_length=0.213,
+):
+    q = np.asarray(joint_pos, dtype=np.float32).reshape(-1, 4, 3)
+    q_hip = q[..., 0]
+    q_thigh = q[..., 1]
+    q_calf = q[..., 2]
+
+    leg_side = np.array([1.0, -1.0, 1.0, -1.0], dtype=np.float32).reshape(1, 4)
+    hip_origin = np.array(
+        [
+            [hip_x_front, hip_y, 0.0],
+            [hip_x_front, -hip_y, 0.0],
+            [hip_x_rear, hip_y, 0.0],
+            [hip_x_rear, -hip_y, 0.0],
+        ],
+        dtype=np.float32,
+    ).reshape(1, 4, 3)
+
+    sagittal_x = -thigh_length * np.sin(q_thigh) - calf_length * np.sin(q_thigh + q_calf)
+    sagittal_z = -thigh_length * np.cos(q_thigh) - calf_length * np.cos(q_thigh + q_calf)
+    lateral_y = leg_side * thigh_offset_y
+
+    cos_hip = np.cos(q_hip)
+    sin_hip = np.sin(q_hip)
+    rel_x = sagittal_x
+    rel_y = cos_hip * lateral_y - sin_hip * sagittal_z
+    rel_z = sin_hip * lateral_y + cos_hip * sagittal_z
+
+    return hip_origin + np.stack((rel_x, rel_y, rel_z), axis=-1)
+
+
+def _posture_to_joint_targets_ik(
+    roll,
+    pitch,
+    height,
+    default_joint_pos,
+    h_nom,
+    lateral_shift=None,
+    hip_x_front=0.1934,
+    hip_x_rear=-0.1934,
+    hip_y=0.0465,
+    thigh_offset_y=0.0955,
+    thigh_length=0.213,
+    calf_length=0.213,
+):
+    default_joint_pos = np.asarray(default_joint_pos, dtype=np.float32).reshape(1, 12)
+    roll = np.asarray([roll], dtype=np.float32).reshape(-1, 1)
+    pitch = np.asarray([pitch], dtype=np.float32).reshape(-1, 1)
+    height = np.asarray([height], dtype=np.float32).reshape(-1, 1)
+
+    nominal_feet_b = _go2_forward_feet_in_base(
+        default_joint_pos,
+        hip_x_front=hip_x_front,
+        hip_x_rear=hip_x_rear,
+        hip_y=hip_y,
+        thigh_offset_y=thigh_offset_y,
+        thigh_length=thigh_length,
+        calf_length=calf_length,
+    )
+    world_rel = nominal_feet_b.copy()
+    if lateral_shift is not None:
+        lateral_shift = np.asarray([lateral_shift], dtype=np.float32).reshape(-1, 1)
+        world_rel[..., 1] -= lateral_shift
+    world_rel[..., 2] += float(h_nom) - height
+
+    cp = np.cos(pitch)
+    sp = np.sin(pitch)
+    cr = np.cos(roll)
+    sr = np.sin(roll)
+
+    x_w = world_rel[..., 0]
+    y_w = world_rel[..., 1]
+    z_w = world_rel[..., 2]
+    x_p = cp * x_w - sp * z_w
+    y_p = y_w
+    z_p = sp * x_w + cp * z_w
+    target_feet_b = np.stack((x_p, cr * y_p + sr * z_p, -sr * y_p + cr * z_p), axis=-1)
+
+    leg_side = np.array([1.0, -1.0, 1.0, -1.0], dtype=np.float32).reshape(1, 4)
+    hip_origin = np.array(
+        [
+            [hip_x_front, hip_y, 0.0],
+            [hip_x_front, -hip_y, 0.0],
+            [hip_x_rear, hip_y, 0.0],
+            [hip_x_rear, -hip_y, 0.0],
+        ],
+        dtype=np.float32,
+    ).reshape(1, 4, 3)
+    foot_h = target_feet_b - hip_origin
+
+    x = foot_h[..., 0]
+    y = foot_h[..., 1]
+    z = foot_h[..., 2]
+    lateral = leg_side * float(thigh_offset_y)
+    yz_sq = np.square(y) + np.square(z)
+    sagittal_z = -np.sqrt(np.clip(yz_sq - float(thigh_offset_y) ** 2, 1.0e-8, None))
+
+    q_hip = _wrap_to_pi(np.arctan2(z, y) - np.arctan2(sagittal_z, lateral))
+    reach_sq = np.clip(np.square(x) + np.square(sagittal_z), 1.0e-8, None)
+    cos_knee = np.clip(
+        (reach_sq - float(thigh_length) ** 2 - float(calf_length) ** 2)
+        / (2.0 * float(thigh_length) * float(calf_length)),
+        -0.999999,
+        0.999999,
+    )
+    q_calf = -np.arccos(cos_knee)
+    q_thigh = np.arctan2(-x, -sagittal_z) - np.arctan2(
+        float(calf_length) * np.sin(q_calf),
+        float(thigh_length) + float(calf_length) * np.cos(q_calf),
+    )
+
+    q_hip = np.clip(q_hip, -1.0472, 1.0472)
+    thigh_lower = np.array([-1.5708, -1.5708, -0.5236, -0.5236], dtype=np.float32).reshape(1, 4)
+    thigh_upper = np.array([3.4907, 3.4907, 4.5379, 4.5379], dtype=np.float32).reshape(1, 4)
+    q_thigh = np.minimum(np.maximum(q_thigh, thigh_lower), thigh_upper)
+    q_calf = np.clip(q_calf, -2.7227, -0.83776)
+
+    return np.stack((q_hip, q_thigh, q_calf), axis=-1).reshape(12).astype(np.float32)
+
+
+def _resolve_activation(name):
+    name = str(name or "elu").lower()
+    if name == "elu":
+        return nn.ELU
+    if name == "selu":
+        return nn.SELU
+    if name == "relu":
+        return nn.ReLU
+    if name == "crelu":
+        return nn.CELU
+    if name == "lrelu":
+        return nn.LeakyReLU
+    if name == "tanh":
+        return nn.Tanh
+    if name == "sigmoid":
+        return nn.Sigmoid
+    if name == "identity":
+        return nn.Identity
+    raise ValueError(f"Invalid activation function {name!r}")
+
+
 class _ActorMLP(nn.Module):
-    def __init__(self, state_dict):
+    def __init__(self, state_dict, activation="elu"):
         super().__init__()
         layer_ids = sorted(
             {
@@ -69,7 +242,7 @@ class _ActorMLP(nn.Module):
             weight = state_dict[f"actor.{layer_id}.weight"]
             modules.append(nn.Linear(weight.shape[1], weight.shape[0]))
             if i < len(layer_ids) - 1:
-                modules.append(nn.ELU())
+                modules.append(_resolve_activation(activation)())
         self.actor = nn.Sequential(*modules)
         self.actor.load_state_dict(
             {
@@ -84,8 +257,200 @@ class _ActorMLP(nn.Module):
         return self.actor(obs)
 
 
+def _default_joint_mirror_perm_and_sign(joint_order):
+    if joint_order == "joint_grouped":
+        return (
+            [1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10],
+            [-1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        )
+    return (
+        [3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8],
+        [-1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0, 1.0],
+    )
+
+
+class _Go2EquivariantActorMLP(nn.Module):
+    """Inference-only port of Go2EquivariantActorInvariantCritic.act_inference()."""
+
+    def __init__(self, state_dict, cfg, joint_order, policy_cfg=None):
+        super().__init__()
+        policy_cfg = policy_cfg or {}
+        self.activation = str(policy_cfg.get("activation", "elu"))
+        self.actor = _ActorMLP(state_dict, activation=self.activation)
+        self.input_dim = self.actor.input_dim
+
+        joint_perm = policy_cfg.get("joint_mirror_perm")
+        joint_sign = policy_cfg.get("joint_mirror_sign")
+        if joint_perm is None or joint_sign is None:
+            joint_perm, joint_sign = _default_joint_mirror_perm_and_sign(joint_order)
+        feet_name_perm = policy_cfg.get("feet_name_mirror_perm") or [1, 0, 3, 2]
+        feet_body_perm = policy_cfg.get("feet_body_mirror_perm") or [1, 0, 3, 2]
+
+        self.register_buffer("joint_mirror_perm", torch.tensor(joint_perm, dtype=torch.long), persistent=False)
+        self.register_buffer("joint_mirror_sign", torch.tensor(joint_sign, dtype=torch.float32), persistent=False)
+        self.register_buffer("feet_name_mirror_perm", torch.tensor(feet_name_perm, dtype=torch.long), persistent=False)
+        self.register_buffer("feet_body_mirror_perm", torch.tensor(feet_body_perm, dtype=torch.long), persistent=False)
+
+        self.base_observation_dim = int(cfg.get("base_observation_dim", 51))
+        self.obs_history_length = int(cfg.get("obs_history_length", 1))
+        self.critic_privileged_observation_dim = int(cfg.get("critic_privileged_observation_dim", 11))
+        self.concurrent_estimator_single_observation_dim = int(
+            cfg.get("concurrent_estimator_single_observation_dim", 141)
+        )
+        self.concurrent_explicit_estimator_output_dim = int(
+            cfg.get("concurrent_explicit_estimator_output_dim", 12)
+        )
+        self.posture_guide_arch_enabled = bool(cfg.get("posture_guide_arch_enabled", True))
+        self.guide_obs_dim = _infer_guide_obs_dim(
+            cfg,
+            self.base_observation_dim,
+            int(cfg.get("adaptation_observation_dim", self.base_observation_dim)),
+        )
+
+    def forward(self, obs):
+        mean = self.actor(obs)
+        mirrored_obs = self._mirror_obs(obs, "policy")
+        mirrored_mean = self._mirror_joint_block(self.actor(mirrored_obs))
+        return 0.5 * (mean + mirrored_mean)
+
+    def _mirror_joint_block(self, data):
+        return data.index_select(-1, self.joint_mirror_perm) * self.joint_mirror_sign.to(data.dtype)
+
+    def _mirror_leg_scalar_block(self, data, body_order):
+        if data.shape[-1] != 4:
+            return data
+        perm = self.feet_body_mirror_perm if body_order else self.feet_name_mirror_perm
+        return data.index_select(-1, perm)
+
+    def _mirror_foot_position_block(self, data):
+        if data.shape[-1] != 12:
+            return data
+        feet = data.reshape(*data.shape[:-1], 4, 3)
+        feet = feet.index_select(-2, self.feet_body_mirror_perm)
+        feet = feet * feet.new_tensor([1.0, -1.0, 1.0])
+        return feet.reshape_as(data)
+
+    @staticmethod
+    def _mirror_vec3(data, kind):
+        if kind == "polar":
+            sign = data.new_tensor([1.0, -1.0, 1.0])
+        elif kind == "axial":
+            sign = data.new_tensor([-1.0, 1.0, -1.0])
+        elif kind == "command":
+            sign = data.new_tensor([1.0, -1.0, -1.0])
+        else:
+            raise ValueError(f"Unknown mirror vec3 kind: {kind}")
+        return data * sign
+
+    def _mirror_guide(data):
+        if data.shape[-1] == 1:
+            return -data
+        if data.shape[-1] == 3:
+            return data * data.new_tensor([-1.0, 1.0, 1.0])
+        raise ValueError(f"Unsupported guide width for PPOeqic: {data.shape[-1]}")
+
+    def _mirror_explicit_state(self, data):
+        out = data.clone()
+        out[..., 0:3] = self._mirror_vec3(out[..., 0:3], "polar")
+        out[..., 3:7] = self._mirror_leg_scalar_block(out[..., 3:7], body_order=False)
+        out[..., 7:11] = self._mirror_leg_scalar_block(out[..., 7:11], body_order=True)
+        return out
+
+    def _mirror_estimator_obs(self, data):
+        out = data.clone()
+        out[..., 0:3] = self._mirror_vec3(out[..., 0:3], "axial")
+        out[..., 3:6] = self._mirror_vec3(out[..., 3:6], "polar")
+        out[..., 6:9] = self._mirror_vec3(out[..., 6:9], "command")
+        out[..., 9:21] = self._mirror_joint_block(out[..., 9:21])
+        out[..., 21:33] = self._mirror_joint_block(out[..., 21:33])
+        out[..., 33:45] = self._mirror_joint_block(out[..., 33:45])
+        out[..., 45:57] = self._mirror_joint_block(out[..., 45:57])
+        offset = 57
+        for _ in range(3):
+            out[..., offset : offset + 12] = self._mirror_joint_block(out[..., offset : offset + 12])
+            offset += 12
+        for _ in range(3):
+            out[..., offset : offset + 12] = self._mirror_joint_block(out[..., offset : offset + 12])
+            offset += 12
+        out[..., 129:141] = self._mirror_foot_position_block(out[..., 129:141])
+        return out
+
+    def _mirror_base_obs(self, data):
+        out = data.clone()
+        if data.shape[-1] in (49, 51):
+            out[..., 0:3] = self._mirror_vec3(out[..., 0:3], "polar")
+            out[..., 3:6] = self._mirror_vec3(out[..., 3:6], "axial")
+            out[..., 6:9] = self._mirror_vec3(out[..., 6:9], "polar")
+            out[..., 9:12] = self._mirror_vec3(out[..., 9:12], "command")
+            out[..., 12:24] = self._mirror_joint_block(out[..., 12:24])
+            out[..., 24:36] = self._mirror_joint_block(out[..., 24:36])
+            out[..., 36:48] = self._mirror_joint_block(out[..., 36:48])
+            out[..., 48:] = self._mirror_guide(out[..., 48:])
+        elif data.shape[-1] in (45, 46, 48):
+            out[..., 0:3] = self._mirror_vec3(out[..., 0:3], "axial")
+            out[..., 3:6] = self._mirror_vec3(out[..., 3:6], "polar")
+            out[..., 6:9] = self._mirror_vec3(out[..., 6:9], "command")
+            out[..., 9:21] = self._mirror_joint_block(out[..., 9:21])
+            out[..., 21:33] = self._mirror_joint_block(out[..., 21:33])
+            out[..., 33:45] = self._mirror_joint_block(out[..., 33:45])
+            if data.shape[-1] > 45:
+                out[..., 45:] = self._mirror_guide(out[..., 45:])
+        else:
+            raise ValueError(f"Unsupported Go2 posture base observation width for PPOeqic: {data.shape[-1]}")
+        return out
+
+    def _mirror_privileged_obs(self, data):
+        out = data.clone()
+        if data.shape[-1] == 11:
+            out[..., 0:3] = self._mirror_vec3(out[..., 0:3], "polar")
+            out[..., 4:7] = self._mirror_guide(out[..., 4:7])
+            out[..., 7:11] = self._mirror_leg_scalar_block(out[..., 7:11], body_order=False)
+        elif data.shape[-1] == 8:
+            out[..., 0:3] = self._mirror_vec3(out[..., 0:3], "polar")
+            out[..., 4:8] = self._mirror_leg_scalar_block(out[..., 4:8], body_order=False)
+        else:
+            raise ValueError(f"Unsupported Go2 posture privileged observation width for PPOeqic: {data.shape[-1]}")
+        return out
+
+    def _mirror_obs(self, obs, obs_type):
+        width = obs.shape[-1]
+        guide_dim = self.guide_obs_dim
+        estimator_dim = self.concurrent_estimator_single_observation_dim
+        explicit_dim = self.concurrent_explicit_estimator_output_dim
+
+        if width == estimator_dim + explicit_dim + guide_dim:
+            out = obs.clone()
+            out[..., :estimator_dim] = self._mirror_estimator_obs(out[..., :estimator_dim])
+            out[..., estimator_dim : estimator_dim + explicit_dim] = self._mirror_explicit_state(
+                out[..., estimator_dim : estimator_dim + explicit_dim]
+            )
+            if guide_dim:
+                out[..., -guide_dim:] = self._mirror_guide(out[..., -guide_dim:])
+            return out
+
+        if width in (46, 48, 49, 51):
+            return self._mirror_base_obs(obs)
+
+        if self.obs_history_length > 1 and width == self.base_observation_dim * self.obs_history_length:
+            return self._mirror_base_obs(
+                obs.reshape(*obs.shape[:-1], self.obs_history_length, self.base_observation_dim)
+            ).reshape_as(obs)
+
+        if obs_type == "critic":
+            priv_dim = self.critic_privileged_observation_dim
+            if width == priv_dim:
+                return self._mirror_privileged_obs(obs)
+            if width > priv_dim:
+                out = obs.clone()
+                out[..., :-priv_dim] = self._mirror_obs(out[..., :-priv_dim], "policy")
+                out[..., -priv_dim:] = self._mirror_privileged_obs(out[..., -priv_dim:])
+                return out
+
+        raise ValueError(f"Unsupported Go2 posture {obs_type} observation width for PPOeqic: {width}")
+
+
 class _PrefixedSequentialMLP(nn.Module):
-    def __init__(self, state_dict, prefix):
+    def __init__(self, state_dict, prefix, activation="elu"):
         super().__init__()
         layer_ids = sorted(
             {
@@ -102,7 +467,7 @@ class _PrefixedSequentialMLP(nn.Module):
             weight = state_dict[f"{prefix}{layer_id}.weight"]
             modules.append(nn.Linear(weight.shape[1], weight.shape[0]))
             if i < len(layer_ids) - 1:
-                modules.append(nn.ELU())
+                modules.append(_resolve_activation(activation)())
         self.net = nn.Sequential(*modules)
         self.net.load_state_dict(
             {
@@ -120,16 +485,61 @@ class _PrefixedSequentialMLP(nn.Module):
         return self.net(inputs)
 
 
-class _RLvRLActorMLP(nn.Module):
+class _RLvRLActorMLP(_Go2EquivariantActorMLP):
     """Student inference path for RLvRLActorCritic checkpoints."""
 
-    def __init__(self, state_dict, actor_obs_dim, history_obs_dim, latent_dim):
-        super().__init__()
-        self.adaptation_module = _PrefixedSequentialMLP(state_dict, "adaptation_module.")
-        self.actor_body = _PrefixedSequentialMLP(state_dict, "actor_body.")
+    def __init__(
+        self,
+        state_dict,
+        actor_obs_dim,
+        history_obs_dim,
+        latent_dim,
+        activation="elu",
+        equivariant=False,
+        cfg=None,
+        joint_order="joint_grouped",
+        policy_cfg=None,
+    ):
+        nn.Module.__init__(self)
+        cfg = cfg or {}
+        policy_cfg = policy_cfg or {}
+        self.activation = str(activation)
+        self.equivariant = bool(equivariant)
+        self.adaptation_module = _PrefixedSequentialMLP(
+            state_dict, "adaptation_module.", activation=self.activation
+        )
+        self.actor_body = _PrefixedSequentialMLP(state_dict, "actor_body.", activation=self.activation)
         self.input_dim = int(actor_obs_dim)
         self.history_input_dim = int(history_obs_dim)
         self.latent_dim = int(latent_dim)
+        self.obs_history_length = int(cfg.get("obs_history_length", 1))
+        self.base_observation_dim = int(cfg.get("base_observation_dim", self.input_dim))
+        self.critic_privileged_observation_dim = int(cfg.get("critic_privileged_observation_dim", 11))
+        self.concurrent_estimator_single_observation_dim = int(
+            cfg.get("concurrent_estimator_single_observation_dim", 141)
+        )
+        self.concurrent_explicit_estimator_output_dim = int(
+            cfg.get("concurrent_explicit_estimator_output_dim", 12)
+        )
+        self.posture_guide_arch_enabled = bool(cfg.get("posture_guide_arch_enabled", True))
+        self.guide_obs_dim = _infer_guide_obs_dim(
+            cfg,
+            self.base_observation_dim,
+            int(cfg.get("adaptation_observation_dim", self.base_observation_dim)),
+        )
+
+        if self.equivariant:
+            joint_perm = policy_cfg.get("joint_mirror_perm")
+            joint_sign = policy_cfg.get("joint_mirror_sign")
+            if joint_perm is None or joint_sign is None:
+                joint_perm, joint_sign = _default_joint_mirror_perm_and_sign(joint_order)
+            feet_name_perm = policy_cfg.get("feet_name_mirror_perm") or [1, 0, 3, 2]
+            feet_body_perm = policy_cfg.get("feet_body_mirror_perm") or [1, 0, 3, 2]
+
+            self.register_buffer("joint_mirror_perm", torch.tensor(joint_perm, dtype=torch.long), persistent=False)
+            self.register_buffer("joint_mirror_sign", torch.tensor(joint_sign, dtype=torch.float32), persistent=False)
+            self.register_buffer("feet_name_mirror_perm", torch.tensor(feet_name_perm, dtype=torch.long), persistent=False)
+            self.register_buffer("feet_body_mirror_perm", torch.tensor(feet_body_perm, dtype=torch.long), persistent=False)
 
         if self.adaptation_module.input_dim != self.history_input_dim:
             raise ValueError(
@@ -148,9 +558,31 @@ class _RLvRLActorMLP(nn.Module):
                 f"checkpoint={self.actor_body.input_dim} expected={expected_actor_body_input}"
             )
 
+    def _student_latent(self, history_obs):
+        if not self.equivariant:
+            return self.adaptation_module(history_obs)
+        mirrored_history_obs = self._mirror_history_obs(history_obs)
+        return 0.5 * (self.adaptation_module(history_obs) + self.adaptation_module(mirrored_history_obs))
+
+    def _mirror_history_obs(self, history_obs):
+        if self.obs_history_length <= 0 or self.history_input_dim % self.obs_history_length != 0:
+            raise ValueError("RLvRL history observation dim must be divisible by obs_history_length.")
+        history_step_dim = self.history_input_dim // self.obs_history_length
+        mirrored = self._mirror_base_obs(
+            history_obs.reshape(*history_obs.shape[:-1], self.obs_history_length, history_step_dim)
+        )
+        return mirrored.reshape_as(history_obs)
+
     def forward(self, obs, history_obs):
-        latent = self.adaptation_module(history_obs)
-        return self.actor_body(torch.cat((obs, latent), dim=-1))
+        latent = self._student_latent(history_obs)
+        actor_input = torch.cat((obs, latent), dim=-1)
+        mean = self.actor_body(actor_input)
+        if not self.equivariant:
+            return mean
+        mirrored_obs = self._mirror_obs(obs, "policy")
+        mirrored_actor_input = torch.cat((mirrored_obs, latent), dim=-1)
+        mirrored_mean = self._mirror_joint_block(self.actor_body(mirrored_actor_input))
+        return 0.5 * (mean + mirrored_mean)
 
 
 class _AdaptationMLP(nn.Module):
@@ -236,7 +668,7 @@ class Go2PosturePolicyWrapper:
 
     This reconstructs the Go2-Posture-Direct-v0 actor observation from MuJoCo
     state and converts policy residual actions into joint position targets:
-    processed_action = guide_action + action_scale * actor_action.
+    processed_action = action_center + action_scale * actor_action.
     """
 
     def __init__(self, env, run_dir=None, checkpoint=None, device=None, use_exported_adaptation=None):
@@ -249,6 +681,12 @@ class Go2PosturePolicyWrapper:
 
         with open(self.run_dir / "params" / "env.yaml", "r") as file:
             self.cfg = yaml.unsafe_load(file)
+        agent_cfg_path = self.run_dir / "params" / "agent.yaml"
+        if agent_cfg_path.exists():
+            with open(agent_cfg_path, "r") as file:
+                self.agent_cfg = yaml.unsafe_load(file)
+        else:
+            self.agent_cfg = {}
 
         self.action_scale = float(self.cfg["action_scale"])
         self.history_length = int(self.cfg["obs_history_length"])
@@ -261,13 +699,33 @@ class Go2PosturePolicyWrapper:
         if self.concurrent_policy_obs_mode not in {"current", "history"}:
             raise ValueError("concurrent_policy_obs_mode must be 'current' or 'history'")
         self.posture_guide_arch_enabled = bool(self.cfg.get("posture_guide_arch_enabled", True))
+        self.posture_guide_action_enabled = bool(self.cfg.get("posture_guide_action_enabled", True))
         self.posture_guide_observation_enabled = bool(self.cfg.get("posture_guide_observation_enabled", True))
         self.posture_guide_target_enabled = bool(self.cfg.get("posture_guide_target_enabled", True))
+        self.guide_obs_dim = _infer_guide_obs_dim(self.cfg, self.base_obs_dim, self.adaptation_obs_dim)
+        self.posture_joint_target_mode = str(
+            os.environ.get("GO2_POSTURE_JOINT_TARGET_MODE", self.cfg.get("posture_joint_target_mode", "heuristic"))
+        ).lower()
+        if self.posture_joint_target_mode not in {"ik", "heuristic"}:
+            raise ValueError("posture_joint_target_mode must be 'ik' or 'heuristic'")
         self.use_rlvrl_teacher_student = bool(self.cfg.get("use_rlvrl_teacher_student", False))
+        self.rlvrl_adaptation_only = bool(self.cfg.get("rlvrl_adaptation_only", False))
         self.RL_FREQ = 1.0 / (float(self.cfg["sim"]["dt"]) * float(self.cfg["decimation"]))
         self.joint_order = os.environ.get("GO2_POSTURE_JOINT_ORDER", "joint_grouped").strip().lower()
         if self.joint_order not in {"leg_grouped", "joint_grouped"}:
             raise ValueError("GO2_POSTURE_JOINT_ORDER must be 'leg_grouped' or 'joint_grouped'")
+        policy_cfg = self.agent_cfg.get("policy", {}) if isinstance(self.agent_cfg, dict) else {}
+        self.policy_class_name = str(
+            policy_cfg.get(
+                "class_name",
+                "RLvRLActorCritic" if self.use_rlvrl_teacher_student else "ActorCritic",
+            )
+        )
+        self.use_equivariant_actor = self.policy_class_name in {
+            "Go2EquivariantActorInvariantCritic",
+            "RLvRLEquivariantActorInvariantCritic",
+        }
+        self.policy_activation = str(policy_cfg.get("activation", "elu"))
 
         ckpt = torch.load(self.checkpoint_path, map_location=self.device)
         state_dict = ckpt["model_state_dict"]
@@ -277,9 +735,21 @@ class Go2PosturePolicyWrapper:
                 actor_obs_dim=int(self.cfg["rlvrl_actor_observation_dim"]),
                 history_obs_dim=int(self.cfg["rlvrl_history_observation_dim"]),
                 latent_dim=int(self.cfg["rlvrl_latent_dim"]),
+                activation=self.policy_activation,
+                equivariant=self.use_equivariant_actor,
+                cfg=self.cfg,
+                joint_order=self.joint_order,
+                policy_cfg=policy_cfg,
+            ).to(self.device)
+        elif self.use_equivariant_actor:
+            self.actor = _Go2EquivariantActorMLP(
+                state_dict,
+                cfg=self.cfg,
+                joint_order=self.joint_order,
+                policy_cfg=policy_cfg,
             ).to(self.device)
         else:
-            self.actor = _ActorMLP(state_dict).to(self.device)
+            self.actor = _ActorMLP(state_dict, activation=self.policy_activation).to(self.device)
         self.actor.eval()
         self.actor.requires_grad_(False)
 
@@ -330,8 +800,11 @@ class Go2PosturePolicyWrapper:
         self.guide_roll = 0.0
         self.guide_pitch = 0.0
         self.guide_height = float(self.cfg["guide_h_nom"])
+        self.guide_lateral_shift = 0.0
         self.guide_action = self.default_joint_pos.copy()
         self.guide_action_policy = self.default_joint_pos_policy.copy()
+        self.estimated_base_lin_vel = np.full(3, np.nan, dtype=np.float32)
+        self.estimated_base_lin_vel_source = "uninitialized"
 
         if use_exported_adaptation is None:
             self.use_exported_adaptation = os.environ.get("GO2_POSTURE_USE_EXPORTED_ADAPTATION", "0") == "1"
@@ -379,9 +852,14 @@ class Go2PosturePolicyWrapper:
             "[go2_posture] loaded "
             f"{self.checkpoint_path} obs_dim={self.actor.input_dim} "
             f"RL_FREQ={self.RL_FREQ:.1f}Hz Kp={self.Kp_walking:.2f} Kd={self.Kd_walking:.2f} "
-            f"joint_order={self.joint_order} rlvrl={self.use_rlvrl_teacher_student}"
+            f"joint_order={self.joint_order} policy_class={self.policy_class_name}"
+            f" activation={self.policy_activation}"
+            f" eqic={self.use_equivariant_actor} rlvrl={self.use_rlvrl_teacher_student}"
             f" rlvrl_actor_obs={self.rlvrl_actor_obs_mode}"
+            f" rlvrl_adaptation_only={self.rlvrl_adaptation_only}"
             f" concurrent_mode={self.concurrent_state_estimator_mode}"
+            f" posture_joint_target_mode={self.posture_joint_target_mode}"
+            f" guide_obs_dim={self.guide_obs_dim}"
         )
         if not self.use_exported_adaptation:
             print("[go2_posture] MuJoCo oracle adaptation is enabled for sim-to-sim.")
@@ -418,7 +896,7 @@ class Go2PosturePolicyWrapper:
                 prev_guide_obs,
             ]
         ).astype(np.float32)
-        adaptation_obs_flat = self._append_adaptation_history(adaptation_obs)
+        adaptation_obs_flat = None if self.rlvrl_adaptation_only else self._append_adaptation_history(adaptation_obs)
 
         if self.concurrent_state_estimator_mode == "explicit":
             estimator_obs = self._build_concurrent_estimator_observation(
@@ -446,8 +924,10 @@ class Go2PosturePolicyWrapper:
                         .numpy()
                     )
                 explicit_state_obs = self._process_concurrent_explicit_output(raw_explicit_state)
+                estimated_velocity_source = "cse"
             else:
                 explicit_state_obs = self._oracle_concurrent_explicit_state(base_lin_vel, feet_contacts, base_pos)
+                estimated_velocity_source = "oracle"
             root_lin_vel_obs = explicit_state_obs[:3]
         elif self.concurrent_state_estimator is not None:
             with torch.no_grad():
@@ -460,21 +940,41 @@ class Go2PosturePolicyWrapper:
                     .cpu()
                     .numpy()
                 )
+            estimated_velocity_source = "cse"
             explicit_state_obs = None
             estimator_obs = None
             estimator_obs_flat = None
         else:
             root_lin_vel_obs = base_lin_vel
+            estimated_velocity_source = "measured"
             explicit_state_obs = None
             estimator_obs = None
             estimator_obs_flat = None
 
+        self.estimated_base_lin_vel = np.asarray(root_lin_vel_obs, dtype=np.float32).reshape(3).copy()
+        self.estimated_base_lin_vel_source = estimated_velocity_source
+
         self._update_guide(command, root_lin_vel_obs[0], velocity_b=root_lin_vel_obs, omega_b=base_ang_vel)
         guide_obs = self._get_guide_observation()
 
-        if self.concurrent_state_estimator_mode == "explicit":
+        if self.rlvrl_adaptation_only:
+            obs_step = np.concatenate(
+                [
+                    base_ang_vel,
+                    self._get_projected_gravity(base_quat_wxyz),
+                    command,
+                    joint_pos - self.default_joint_pos_policy,
+                    joint_vel,
+                    self.last_action,
+                    guide_obs,
+                ]
+            ).astype(np.float32)
+            adaptation_obs_flat = self._append_adaptation_history(obs_step)
+            obs = obs_step.copy()
+        elif self.concurrent_state_estimator_mode == "explicit":
             actor_base_obs = estimator_obs_flat if self.concurrent_policy_obs_mode == "history" else estimator_obs
             obs_step = np.concatenate([actor_base_obs, explicit_state_obs, guide_obs]).astype(np.float32)
+            obs = obs_step.copy()
         else:
             obs_step = np.concatenate(
                 [
@@ -488,10 +988,10 @@ class Go2PosturePolicyWrapper:
                     guide_obs,
                 ]
             ).astype(np.float32)
+            obs_history_flat = self._append_obs_history(obs_step)
+            obs = obs_history_flat
         if obs_step.shape[0] != self.base_obs_dim:
             raise ValueError(f"go2_posture obs_step dim mismatch: got={obs_step.shape[0]} expected={self.base_obs_dim}")
-        obs_history_flat = self._append_obs_history(obs_step)
-        obs = obs_step.copy() if self.concurrent_state_estimator_mode == "explicit" else obs_history_flat
 
         if self.use_rma:
             if self.rma_network is not None:
@@ -521,7 +1021,10 @@ class Go2PosturePolicyWrapper:
             action = action_t.squeeze(0).detach().cpu().numpy().astype(np.float32)
 
         self.last_action = action.copy()
-        joint_target_policy = self.guide_action_policy + self.action_scale * action
+        action_center_policy = (
+            self.guide_action_policy if self.posture_guide_action_enabled else self.default_joint_pos_policy
+        )
+        joint_target_policy = action_center_policy + self.action_scale * action
         self.cse_llast_joint_target_policy = self.cse_previous_joint_target_policy.copy()
         self.cse_previous_joint_target_policy = joint_target_policy.copy()
         joint_target = self._to_leg_grouped(joint_target_policy)
@@ -573,11 +1076,18 @@ class Go2PosturePolicyWrapper:
             return np.zeros(12, dtype=np.float32)
 
     def _get_guide_observation(self):
-        if not self.posture_guide_arch_enabled:
+        if not self.posture_guide_arch_enabled or self.guide_obs_dim == 0:
             return np.zeros(0, dtype=np.float32)
         if self.posture_guide_observation_enabled:
-            return np.array([self.guide_roll, self.guide_pitch, self.guide_height], dtype=np.float32)
-        return np.array([0.0, 0.0, float(self.cfg["guide_h_nom"])], dtype=np.float32)
+            if self.guide_obs_dim == 1:
+                return np.array([self.guide_roll], dtype=np.float32)
+            if self.guide_obs_dim == 3:
+                return np.array([self.guide_roll, self.guide_pitch, self.guide_height], dtype=np.float32)
+        if self.guide_obs_dim == 1:
+            return np.zeros(1, dtype=np.float32)
+        if self.guide_obs_dim == 3:
+            return np.array([0.0, 0.0, float(self.cfg["guide_h_nom"])], dtype=np.float32)
+        raise ValueError(f"Unsupported guide observation dim: {self.guide_obs_dim}")
 
     def _append_obs_history(self, obs_step):
         self.obs_history[:-1] = self.obs_history[1:]
@@ -645,22 +1155,71 @@ class Go2PosturePolicyWrapper:
         abs_wz = abs(yaw_rate)
         a_lat = vel_mag * abs_wz
 
-        roll_raw = float(self.cfg["guide_k_roll"]) * np.arctan(a_lat / g)
-        turn_sign = float(command[2]) if abs(float(command[2])) > 1e-6 else yaw_rate
-        roll_signed = -roll_raw if turn_sign > 0.0 else roll_raw
-        if abs_wz < 1e-6 or vel_mag < 1e-6:
-            roll_signed = 0.0
-
-        pitch_raw = float(self.cfg["guide_k_pitch"]) * np.arctan(self.a_long_filtered / g)
-        pitch = -pitch_raw
-        height = (
-            float(self.cfg["guide_h_nom"])
-            - float(self.cfg["guide_kh_lat"]) * a_lat
-            - float(self.cfg["guide_kh_long"]) * abs(self.a_long_filtered)
-            - float(self.cfg["guide_kh_speed"]) * vel_mag**2
+        roll_sign_mode = self.cfg.get("guide_roll_sign_mode")
+        if roll_sign_mode == "signed_lateral_accel":
+            roll_lateral_accel = float(command[0]) * float(command[2])
+            roll_signed = -float(self.cfg["guide_k_roll"]) * np.arctan(roll_lateral_accel / g)
+            if abs(roll_lateral_accel) < 1e-6:
+                roll_signed = 0.0
+        elif roll_sign_mode == "legacy_yaw_sign":
+            roll_lateral_accel = float(command[0]) * float(command[2])
+            roll_raw = float(self.cfg["guide_k_roll"]) * np.arctan(abs(roll_lateral_accel) / g)
+            roll_signed = -roll_raw if float(command[2]) > 0.0 else roll_raw
+            if abs(float(command[2])) < 1e-6 or abs(roll_lateral_accel) < 1e-6:
+                roll_signed = 0.0
+        elif roll_sign_mode is None:
+            # Preserve checkpoints saved before guide_roll_sign_mode was introduced.
+            roll_raw = float(self.cfg["guide_k_roll"]) * np.arctan(a_lat / g)
+            turn_sign = float(command[2]) if abs(float(command[2])) > 1e-6 else yaw_rate
+            roll_signed = -roll_raw if turn_sign > 0.0 else roll_raw
+            if abs_wz < 1e-6 or vel_mag < 1e-6:
+                roll_signed = 0.0
+        else:
+            raise ValueError(
+                "guide_roll_sign_mode must be 'signed_lateral_accel' or "
+                f"'legacy_yaw_sign', got {roll_sign_mode!r}"
+            )
+        roll_clamp_enabled = bool(
+            self.cfg.get("guide_roll_clamp_enabled", self.cfg.get("guide_clamp_enabled", False))
         )
-        if bool(self.cfg.get("guide_clamp_enabled", True)):
+        if roll_clamp_enabled:
             roll_signed = float(np.clip(roll_signed, -float(self.cfg["guide_roll_max"]), float(self.cfg["guide_roll_max"])))
+
+        pitch = 0.0
+        if not bool(self.cfg.get("height_guide_enabled", False)):
+            height = float(self.cfg["guide_h_nom"])
+        elif "adaptive_height_use_paper" in self.cfg:
+            v_max = max(float(self.cfg.get("adaptive_height_v_max", 3.5)), 1.0e-6)
+            yaw_max = max(float(self.cfg.get("adaptive_height_yaw_max", 3.0)), 1.0e-6)
+            speed_weight = float(self.cfg.get("adaptive_height_speed_weight", 0.0))
+            yaw_weight = float(self.cfg.get("adaptive_height_yaw_weight", 1.0))
+            gamma = float(self.cfg.get("adaptive_height_gamma", 0.05))
+            command_speed = float(np.linalg.norm(command[:2]))
+            linear_ratio = float(np.clip(command_speed / v_max, 0.0, 1.0))
+            yaw_for_height = float(command[2]) if bool(self.cfg.get("adaptive_height_use_command_yaw", True)) else yaw_rate
+            yaw_ratio = float(np.clip(abs(yaw_for_height) / yaw_max, 0.0, 1.0))
+            motion_ratio = float(
+                np.clip(np.sqrt((speed_weight * linear_ratio) ** 2 + (yaw_weight * yaw_ratio) ** 2), 0.0, 1.0)
+            )
+            if bool(self.cfg.get("adaptive_height_use_paper", True)):
+                height = (1.0 - gamma * motion_ratio) * float(self.cfg["guide_h_nom"])
+            else:
+                speed_ref = max(
+                    float(self.cfg.get("guide_height_speed_gate_v_ref", self.cfg.get("adaptive_height_v_max", 3.0))),
+                    1.0e-6,
+                )
+                speed_gate = float(np.clip(vel_mag / speed_ref, 0.0, 1.0))
+                height = float(self.cfg["guide_h_nom"]) - float(self.cfg.get("guide_kh_yaw", 0.0)) * abs(yaw_for_height) * speed_gate
+        else:
+            pitch_raw = float(self.cfg.get("guide_k_pitch", 0.0)) * np.arctan(self.a_long_filtered / g)
+            pitch = -pitch_raw
+            height = (
+                float(self.cfg["guide_h_nom"])
+                - float(self.cfg["guide_kh_lat"]) * a_lat
+                - float(self.cfg["guide_kh_long"]) * abs(self.a_long_filtered)
+                - float(self.cfg["guide_kh_speed"]) * vel_mag**2
+            )
+        if bool(self.cfg.get("guide_clamp_enabled", True)):
             pitch = float(np.clip(pitch, -float(self.cfg["guide_pitch_max"]), float(self.cfg["guide_pitch_max"])))
             height = float(np.clip(height, float(self.cfg["guide_h_min"]), float(self.cfg["guide_h_nom"])))
 
@@ -668,14 +1227,47 @@ class Go2PosturePolicyWrapper:
             roll_signed = 0.0
             pitch = 0.0
             height = float(self.cfg["guide_h_nom"])
+            lateral_shift = 0.0
+        else:
+            if bool(self.cfg.get("guide_roll_rate_limit_enabled", False)):
+                delta_max = float(self.cfg.get("guide_roll_rate_limit", 1.5)) * ctrl_dt
+                roll_delta = float(np.clip(roll_signed - self.guide_roll, -delta_max, delta_max))
+                roll_signed = self.guide_roll + roll_delta
+            lateral_shift = self._compute_lateral_shift_guide(command)
 
         self.guide_roll = roll_signed
         self.guide_pitch = pitch
         self.guide_height = height
-        self.guide_action = self._posture_to_joint_targets(roll_signed, pitch, height)
+        self.guide_lateral_shift = lateral_shift
+        self.guide_action = self._posture_to_joint_targets(roll_signed, pitch, height, lateral_shift)
         self.guide_action_policy = self._to_policy_order(self.guide_action)
 
-    def _posture_to_joint_targets(self, roll, pitch, height):
+    def _compute_lateral_shift_guide(self, command):
+        if not bool(self.cfg.get("lateral_shift_guide_enabled", True)):
+            return 0.0
+        shift = (
+            float(self.cfg.get("guide_lateral_shift_gain", 0.30))
+            * float(self.cfg.get("guide_h_nom", 0.34))
+            * float(command[0])
+            * float(command[2])
+            / max(float(self.cfg.get("guide_gravity", 9.81)), 1.0e-6)
+        )
+        shift_max = float(self.cfg.get("guide_lateral_shift_max", 0.04))
+        if shift_max > 0.0:
+            shift = float(np.clip(shift, -shift_max, shift_max))
+        return shift
+
+    def _posture_to_joint_targets(self, roll, pitch, height, lateral_shift=0.0):
+        if self.posture_joint_target_mode == "ik":
+            return _posture_to_joint_targets_ik(
+                roll,
+                pitch,
+                height,
+                self.default_joint_pos,
+                float(self.cfg["guide_h_nom"]),
+                lateral_shift=lateral_shift,
+            )
+
         delta = np.zeros(12, dtype=np.float32)
         delta[[0, 3, 6, 9]] = float(self.cfg["k_roll_hip"]) * roll
         delta[[1, 4]] = float(self.cfg["k_pitch_thigh"]) * pitch

@@ -1,0 +1,88 @@
+Go2 full-guide signed-roll deployment notes
+============================================
+
+Run
+---
+Training run:
+  2026-08-02_14-55-17_2026-08-02_14-54-53_full_guide_signed_s42
+
+Committed checkpoint:
+  model_4999.pt
+
+Training algorithm:
+  PPO with symmetry data augmentation enabled
+  seed: 42
+  actor hidden dimensions: [512, 256, 128]
+  activation: ELU
+
+Observation and estimator
+-------------------------
+Policy observation dimension: 153
+Adaptation observation dimension per step: 46
+Adaptation history length: 15 (46 * 15 = 690)
+Concurrent estimator mode: explicit
+Concurrent estimator input dimension: 141
+Concurrent estimator output dimension: 11
+
+The committed concurrent_explicit_estimator.pth must be loaded in eval mode.
+It is an inference-only frozen estimator during MuJoCo and real deployment.
+
+Signed roll guide
+-----------------
+The saved env.yaml selects:
+  guide_roll_sign_mode: signed_lateral_accel
+  guide_k_roll: 0.75
+  guide_gravity: 9.81
+  guide_roll_max: 0.523599 rad (30 degrees)
+  guide_roll_rate_limit: 1.5 rad/s
+
+The training and deployment equations are:
+
+  a_lat_cmd = vx_cmd * wz_cmd
+
+  roll_target_raw = -guide_k_roll * atan(a_lat_cmd / guide_gravity)
+
+  roll_target_clamped = clamp(
+      roll_target_raw,
+      -guide_roll_max,
+      +guide_roll_max,
+  )
+
+At each policy update:
+
+  max_delta = guide_roll_rate_limit * policy_dt
+  guide_roll = previous_guide_roll + clamp(
+      roll_target_clamped - previous_guide_roll,
+      -max_delta,
+      +max_delta,
+  )
+
+The policy runs at 50 Hz, so policy_dt is 0.02 s and max_delta is 0.03 rad
+per policy update. Reverse motion reverses the required roll direction because
+vx_cmd is signed.
+
+Full-guide action prior
+-----------------------
+This model has posture_guide_action_enabled=true and
+posture_joint_target_mode=ik. The final joint target is:
+
+  q_des = IK(guide_roll, guide_pitch=0, guide_height=0.34) \
+          + action_scale * policy_action
+
+where action_scale is 0.25. Do not replace the IK action center with the
+default standing joint pose.
+
+Implementation
+--------------
+deploy/go2_posture_policy_wrapper.py reads guide_roll_sign_mode from env.yaml.
+For signed_lateral_accel checkpoints it uses the equations above. Checkpoints
+without guide_roll_sign_mode retain the historical deployment calculation for
+backward compatibility.
+
+Required committed files
+------------------------
+  model_4999.pt
+  params/env.yaml
+  params/agent.yaml
+  exported/concurrent_explicit_estimator.pth
+  deploy/go2_posture_policy_wrapper.py
