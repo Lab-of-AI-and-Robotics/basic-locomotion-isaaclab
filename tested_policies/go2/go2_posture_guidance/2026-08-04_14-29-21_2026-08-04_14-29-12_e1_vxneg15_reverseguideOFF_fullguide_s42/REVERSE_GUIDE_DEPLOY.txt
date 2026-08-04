@@ -1,0 +1,36 @@
+Go2 reverse-guide-OFF full-guide deployment notes
+=================================================
+
+Checkpoint: model_2550.pt
+Seed: 42
+Policy observation dimension: 153
+Posture mode: full_guide
+Joint target mode: analytic IK
+Concurrent estimator mode: explicit, frozen inference
+
+The saved env.yaml contains:
+
+  guide_roll_sign_mode: signed_lateral_accel
+  guide_roll_disable_for_reverse: true
+  guide_roll_rate_limit: 1.5 rad/s
+  guide_k_roll: 0.75
+  guide_roll_max: 0.523599 rad
+
+Forward command behavior:
+
+  a_lat_cmd = vx_cmd * wz_cmd
+  roll_raw = -guide_k_roll * atan(a_lat_cmd / 9.81)
+  roll_target = clamp(roll_raw, -guide_roll_max, +guide_roll_max)
+
+Reverse command behavior:
+
+  if vx_cmd < 0:
+      roll_target = 0
+
+The normal roll rate limiter is applied after this override, so the guide
+transitions continuously toward zero instead of changing instantaneously.
+
+deploy/go2_posture_policy_wrapper.py must read
+guide_roll_disable_for_reverse from env.yaml. The committed implementation
+does so. This model also requires its own exported
+concurrent_explicit_estimator.pth file.

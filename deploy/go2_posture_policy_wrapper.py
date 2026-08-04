@@ -1179,6 +1179,8 @@ class Go2PosturePolicyWrapper:
                 "guide_roll_sign_mode must be 'signed_lateral_accel' or "
                 f"'legacy_yaw_sign', got {roll_sign_mode!r}"
             )
+        if bool(self.cfg.get("guide_roll_disable_for_reverse", False)) and float(command[0]) < 0.0:
+            roll_signed = 0.0
         roll_clamp_enabled = bool(
             self.cfg.get("guide_roll_clamp_enabled", self.cfg.get("guide_clamp_enabled", False))
         )
