@@ -1,7 +1,7 @@
 Go2 reverse-guide-OFF full-guide deployment notes
 =================================================
 
-Checkpoint: model_2550.pt
+Latest committed checkpoint: model_3800.pt
 Seed: 42
 Policy observation dimension: 153
 Posture mode: full_guide
