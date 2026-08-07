@@ -1,0 +1,74 @@
+Go2 baseline corridor deployment notes
+=======================================
+
+Run
+---
+Training run:
+  2026-08-07_06-42-56_2026-08-07_06-42-47_baseline_corridor_vxneg35_s42
+
+Committed checkpoint:
+  model_4999.pt
+
+Training algorithm:
+  PPO with symmetry data augmentation enabled
+  seed: 42
+  actor hidden dimensions: [512, 256, 128]
+  critic hidden dimensions: [512, 256, 128]
+  activation: ELU
+
+Observation and estimator
+-------------------------
+Policy observation dimension: 152
+Adaptation observation dimension per step: 45
+Adaptation history length: 15 (45 * 15 = 675)
+Concurrent estimator mode: explicit
+Concurrent estimator input dimension: 141
+Concurrent estimator output dimension: 11
+
+The estimator output is:
+  body linear velocity: 3
+  foot contact state: 4
+  foot height: 4
+
+Load exported/concurrent_explicit_estimator.pth in eval mode and keep its
+parameters frozen during MuJoCo and real deployment. This policy does not use
+RMA or the RLvRL teacher-student architecture.
+
+Baseline posture configuration
+------------------------------
+The saved env.yaml selects:
+  posture_ablation_mode: baseline_no_posture_stable
+  posture_guide_arch_enabled: false
+  posture_guide_action_enabled: false
+  posture_guide_observation_enabled: false
+  posture_guide_target_enabled: false
+
+Therefore this checkpoint must not receive the one-dimensional roll-guide
+observation used by the 153-dimensional guided policies. It also does not use
+an IK guide action center. The final joint target is:
+
+  q_des = default_joint_pos + action_scale * policy_action
+
+where action_scale is 0.25.
+
+Control and command configuration
+---------------------------------
+Policy frequency: 50 Hz
+PD stiffness: 25.0
+PD damping: 0.5
+Base-height reward mode: corridor
+Base-height corridor: [0.22, 0.38] m
+Base-height nominal target: 0.34 m
+
+Training command grid:
+  vx: [-3.5, 3.5]
+  vy: [-0.6, 0.6]
+  wz: [-3.5, 3.5]
+
+Required committed files
+------------------------
+  model_4999.pt
+  params/env.yaml
+  params/agent.yaml
+  exported/concurrent_explicit_estimator.pth
+  BASELINE_DEPLOY.txt
