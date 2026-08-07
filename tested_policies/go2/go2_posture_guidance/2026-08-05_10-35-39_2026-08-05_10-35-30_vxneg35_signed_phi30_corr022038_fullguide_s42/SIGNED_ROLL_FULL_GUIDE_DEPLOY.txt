@@ -1,0 +1,91 @@
+Go2 signed-roll full-guide reverse-range deployment notes
+=========================================================
+
+Run
+---
+Training run:
+  2026-08-05_10-35-39_2026-08-05_10-35-30_vxneg35_signed_phi30_corr022038_fullguide_s42
+
+Committed checkpoint:
+  model_4999.pt
+
+Training algorithm:
+  PPO with symmetry data augmentation enabled
+  seed: 42
+  actor hidden dimensions: [512, 256, 128]
+  critic hidden dimensions: [512, 256, 128]
+  activation: ELU
+
+Observation and estimator
+-------------------------
+Policy observation dimension: 153
+Adaptation observation dimension per step: 46
+Adaptation history length: 15 (46 * 15 = 690)
+Concurrent estimator mode: explicit
+Concurrent estimator input dimension: 141
+Concurrent estimator output dimension: 11
+
+The estimator output is:
+  body linear velocity: 3
+  foot contact state: 4
+  foot height: 4
+
+Load exported/concurrent_explicit_estimator.pth in eval mode and keep its
+parameters frozen during MuJoCo and real deployment. This policy does not use
+RMA or the RLvRL teacher-student architecture.
+
+Signed roll guide
+-----------------
+The saved env.yaml selects:
+  posture_ablation_mode: full_guide
+  posture_guide_action_enabled: true
+  posture_guide_observation_enabled: true
+  posture_joint_target_mode: ik
+  guide_roll_sign_mode: signed_lateral_accel
+  guide_roll_disable_for_reverse: false
+  guide_k_roll: 0.75
+  guide_gravity: 9.81
+  guide_roll_max: 0.523599 rad (30 degrees)
+  guide_roll_rate_limit: 1.5 rad/s
+
+The guide target is calculated as:
+
+  a_lat_cmd = vx_cmd * wz_cmd
+  roll_raw = -guide_k_roll * atan(a_lat_cmd / guide_gravity)
+  roll_target = clamp(roll_raw, -guide_roll_max, +guide_roll_max)
+
+The normal rate limiter is applied to roll_target at 50 Hz. Because
+guide_roll_disable_for_reverse is false, signed vx is retained and reverse
+motion reverses the guide-roll direction for the same yaw command.
+
+Full-guide action prior
+-----------------------
+This policy uses the analytic IK guide as its action center. The final joint
+target is:
+
+  q_des = IK(guide_roll, guide_pitch=0, guide_height=0.34) \
+          + action_scale * policy_action
+
+where action_scale is 0.25. Do not replace the IK action center with the
+default standing joint pose.
+
+Control and command configuration
+---------------------------------
+Policy frequency: 50 Hz
+PD stiffness: 25.0
+PD damping: 0.5
+Base-height reward mode: corridor
+Base-height corridor: [0.22, 0.38] m
+
+Training command grid:
+  vx: [-3.5, 3.5]
+  vy: [-0.6, 0.6]
+  wz: [-3.5, 3.5]
+
+Required committed files
+------------------------
+  model_4999.pt
+  params/env.yaml
+  params/agent.yaml
+  exported/concurrent_explicit_estimator.pth
+  SIGNED_ROLL_FULL_GUIDE_DEPLOY.txt
